@@ -1,0 +1,123 @@
+/*
+ * KINETIQ — ESP32-S3-DevKitC-1 / ESP32-S3-WROOM-1-N16R8 devicetree overlay
+ * Target: ESP32-S3-DevKitC-1 (n16r8), Zephyr `esp32s3_devkitc_n16r8`
+ *
+ * ---------------------------------------------------------------------------
+ * PIN MAP (locked, keep clear of: GPIO0/GPIO3 strapping, GPIO45/GPIO46
+ * strapping, GPIO19/GPIO20 native USB D-/D+, GPIO26..GPIO32 module flash+PSRAM)
+ * ---------------------------------------------------------------------------
+ *   I2C0  (400 kHz, 4k7 external pull-ups, shared bus)
+ *     SDA = GPIO8
+ *     SCL = GPIO9
+ *     BMI270  IMU   @ 0x68
+ *     MAX30102 PPG  @ 0x57
+ *
+ *   SPI2  (display bus, 40 MHz)
+ *     SCK = GPIO12   (FSPI clock)
+ *     MOSI = GPIO11  (FSPI data to panel)
+ *     MISO = GPIO13  reserved, display is write-only (left unpopulated)
+ *     CS  = GPIO10   (active low)
+ *     DC  = GPIO14   (active low: command/data select)
+ *     RST = GPIO21   (active low, panel reset)
+ *     BL  = GPIO47   (LEDC PWM backlight, active high)
+ *
+ *   Direct GPIO (not on a serial bus)
+ *     INT_BMI270 = GPIO4   (active high, data-ready)
+ *     INT_MAX30102 = GPIO5 (active low)
+ *     PTT mic I2S = GPIO6 (BCLK), GPIO15 (WS), GPIO16 (DOUT)
+ *     Charging sense = GPIO17 (active low)
+ * ---------------------------------------------------------------------------
+ */
+
+/* I2C0 pinmux: SDA = GPIO8, SCL = GPIO9, open-drain with internal pull-up
+ * enabled in addition to the 4k7 discrete pull-ups on the shared bus.
+ */
+&pinctrl {
+	i2c0_default: i2c0_default {
+		group-index = <0>;
+		drive-open-drain;
+		bias-pull-up;
+		pins = "GPIO8", "GPIO9";
+	};
+
+	i2c0_sleep: i2c0_sleep {
+		group-index = <0>;
+		drive-open-drain;
+		bias-pull-up;
+		lpsr-capable;
+		sleep-pin-in-suspend;
+		pins = "GPIO8", "GPIO9";
+	};
+
+	/* SPI2 pinmux: pin order SCK(GPIO12), MOSI(GPIO11), CS(GPIO10), DC(GPIO14). */
+	spi2_default: spi2_default {
+		group-index = <1>;
+		slew-rate;
+		pins = "GPIO12", "GPIO11", "GPIO10", "GPIO14";
+	};
+
+	spi2_sleep: spi2_sleep {
+		group-index = <1>;
+		lpsr-capable;
+		sleep-pin-in-suspend;
+		pins = "GPIO12", "GPIO11", "GPIO10", "GPIO14";
+	};
+};
+
+/* I2C0 controller: SDA = GPIO8, SCL = GPIO9 @ 400 kHz (I2C_BITRATE_FAST). */
+&i2c0 {
+	status = "okay";
+	clock-frequency = <I2C_BITRATE_FAST>;
+
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-1 = <&i2c0_sleep>;
+	pinctrl-names = "default", "sleep";
+
+	/* Bosch BMI270 6-axis IMU (accel + gyro), 400 kHz shared bus. */
+	bmi270: bmi270@68 {
+		compatible = "bosch,bmi270";
+		reg = <0x68>;
+		label = "BMI270";
+		irq-gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
+	};
+
+	/* Maxim MAX30102 dual-LED PPG (red + IR), still-only SpO2 estimate. */
+	max30102: max30102@57 {
+		compatible = "maxim,max30102";
+		reg = <0x57>;
+		label = "MAX30102";
+		irq-gpios = <&gpio0 5 GPIO_ACTIVE_LOW>;
+	};
+};
+
+/* SPI2 controller: SCK = GPIO12, MOSI = GPIO11, CS = GPIO10 @ 40 MHz. */
+&spi2 {
+	status = "okay";
+	clock-frequency = <SPI_CLOCK_DIV2>;
+	cs-gpios = <&gpio0 10 GPIO_ACTIVE_LOW>;
+
+	pinctrl-0 = <&spi2_default>;
+	pinctrl-1 = <&spi2_sleep>;
+	pinctrl-names = "default", "sleep";
+
+	/* Solomon Systech GC9A01 240x240 round IPS panel. */
+	gc9a01: gc9a01@0 {
+		compatible = "solomon,gc9a01";
+		reg = <0>;
+		spi-max-frequency = <40000000>;
+
+		width = <240>;
+		height = <240>;
+		round;
+		rotate = <0>;
+
+		dc-gpios = <&gpio0 14 GPIO_ACTIVE_LOW>;
+		reset-gpios = <&gpio0 21 GPIO_ACTIVE_LOW>;
+
+		/*
+		 * Backlight is a plain LEDC PWM channel on GPIO47, driven from
+		 * TIMER0 LEDC channel 0 in firmware (display_dim()/display_wake()).
+		 */
+		backlight-gpios = <&gpio1 47 GPIO_ACTIVE_HIGH>;
+	};
+};

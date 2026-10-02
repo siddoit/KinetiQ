@@ -1,0 +1,5 @@
+pyserial==3.5
+bleak==0.22.0
+faster-whisper==1.0.3
+requests==2.32.3
+piper-tts==1.2.0
