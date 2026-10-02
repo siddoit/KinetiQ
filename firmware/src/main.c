@@ -11,9 +11,15 @@
  *             display_engine owns the canonical screen state plus the
  *             240x240 round GC9A01 ASCII-grid preview (short-press cycles it,
  *             infer_thread feeds it telemetry, button long-press drives PTT)
+ *
+ * Sense HAL  : sensor_imu / sensor_ppg dual-mode wrappers: real BMI270 /
+ *             MAX30102 hardware when the devicetree nodes probe, otherwise
+ *             the synthetic fallback generators (same waveforms as before).
  */
 
 #include <zephyr/kernel.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/util.h>
@@ -22,6 +28,8 @@
 #include <string.h>
 
 #include "sensor_packet.h"
+#include "sensor_imu.h"
+#include "sensor_ppg.h"
 #include "button_fsm.h"
 #include "activity_engine.h"
 #include "display_engine.h"
@@ -180,52 +188,29 @@ static void imu_thread(void *a, void *b, void *c)
 	ARG_UNUSED(c);
 
 	sensor_packet_t pkt;
-	float t = 0.0f;
-	float phase = 0.0f;
-	float cadence = 0.0f;
+	float accel[3];
+	float gyro[3];
 
-	LOG_INF("imu_thread up: 100 Hz synthetic BMI270 stream");
+	LOG_INF("imu_thread up: 100 Hz BMI270 stream (%s)",
+		sensor_imu_is_hardware_active() ? "hardware" : "synthetic fallback");
 
 	while (1) {
-		t += (float)IMU_PERIOD_MS / 1000.0f;
-
-		/* Cadence ramps REST -> WALK -> RUN -> WALK -> REST on a 60 s cycle. */
-		cadence += (float)IMU_PERIOD_MS / 1000.0f / 60.0f;
-		if (cadence >= 1.0f) {
-			cadence -= 1.0f;
-		}
-		float ramp = (4.0f * fabsf(cadence - 0.5f)) - 1.0f; /* -1 .. +1 */
-		float effort = 0.5f + (0.5f * ramp);               /* 0 .. 1 */
-		float freq = 0.8f + (1.8f * effort);
-		float accel_amp = 0.5f + (3.0f * effort);
-		float gyro_amp = 0.5f + (6.0f * effort);
-
-		phase += 2.0f * PI_F * freq * ((float)IMU_PERIOD_MS / 1000.0f);
-		if (phase > 2.0f * PI_F) {
-			phase -= 2.0f * PI_F;
-		}
-
-		float ax = 0.20f * accel_amp * sinf(phase * 0.5f);
-		float ay = 0.20f * accel_amp * cosf(phase * 0.5f);
-		float az = 9.81f + (accel_amp * sinf(phase));
-		float gx = gyro_amp * cosf(phase);
-		float gy = 0.35f * gyro_amp * sinf(phase);
-		float gz = 0.15f * gyro_amp * sinf(phase + 0.6f);
+		sensor_imu_fetch(accel, gyro);
 
 		int64_t now_ms = k_uptime_get();
 
-		if (cadence_detect(az, now_ms) != 0) {
+		if (cadence_detect(accel[2], now_ms) != 0) {
 			atomic_inc(&g_steps);
 		}
 
 		memset(&pkt, 0, sizeof(pkt));
 		pkt.timestamp_ms = now_ms;
-		pkt.accel_x = ax;
-		pkt.accel_y = ay;
-		pkt.accel_z = az;
-		pkt.gyro_x = gx;
-		pkt.gyro_y = gy;
-		pkt.gyro_z = gz;
+		pkt.accel_x = accel[0];
+		pkt.accel_y = accel[1];
+		pkt.accel_z = accel[2];
+		pkt.gyro_x = gyro[0];
+		pkt.gyro_y = gyro[1];
+		pkt.gyro_z = gyro[2];
 		pkt.steps = (uint32_t)atomic_get(&g_steps);
 		pkt.quality = 0;
 		pkt.activity = NULL;
@@ -244,43 +229,32 @@ static void ppg_thread(void *a, void *b, void *c)
 	ARG_UNUSED(c);
 
 	sensor_packet_t pkt;
-	float ph = 0.0f;
-	float t = 0.0f;
 
-	LOG_INF("ppg_thread up: 50 Hz synthetic MAX30102 stream");
+	LOG_INF("ppg_thread up: 50 Hz MAX30102 stream (%s)",
+		sensor_ppg_is_hardware_active() ? "hardware" : "synthetic fallback");
 
 	while (1) {
-		t += (float)PPG_PERIOD_MS / 1000.0f;
+		uint32_t raw_red = 0;
+		uint32_t raw_ir = 0;
+		uint8_t hr = 72;
+		uint8_t spo2 = 97;
+		bool quality = true;
 
-		/* Plethysmograph: fundamental pulse plus a dicrotic notch term. */
-		ph += 2.0f * PI_F * PPG_NOMINAL_BPM / 60.0f / 50.0f;
-		if (ph > 2.0f * PI_F) {
-			ph -= 2.0f * PI_F;
-		}
+		sensor_ppg_fetch(&raw_red, &raw_ir, &hr, &spo2, &quality);
+		/* Telemetry schema carries no SpO2-from-PPG field yet; the
+		 * infer/comm path keeps the constant 97. Drop is explicit. */
+		(void)spo2;
 
-		float pulse = powf(sinf(ph), 2.0f);
-		float dicrotic = powf(sinf((2.0f * ph) + 0.35f), 4.0f);
-		float breath = 1.0f + (0.02f * sinf(0.30f * t));
-
-		float red = (PPG_RED_DC + (PPG_RED_AC * (pulse + (0.35f * dicrotic)))) * breath;
-		float ir = (PPG_IR_DC + (PPG_IR_AC * (pulse + (0.30f * dicrotic)))) * breath;
-
-		int hr_wander = (int)(3.0f * sinf(0.05f * t));
-		int hr = PPG_NOMINAL_BPM + hr_wander;
-		if (hr < 60) {
-			hr = 60;
-		}
-		if (hr > 80) {
-			hr = 80;
-		}
+		/* ppg_red is uint16_t: raw counts can exceed 65535, clamp. */
+		uint16_t pkt_red = raw_red > 65535U ? 65535U : (uint16_t)raw_red;
 
 		memset(&pkt, 0, sizeof(pkt));
 		pkt.timestamp_ms = k_uptime_get();
-		pkt.ppg_red = (uint16_t)red;
-		pkt.ppg_ir = (uint32_t)ir;
+		pkt.ppg_red = pkt_red;
+		pkt.ppg_ir = raw_ir;
 		pkt.heart_rate = (uint16_t)hr;
 		pkt.steps = (uint32_t)atomic_get(&g_steps);
-		pkt.quality = 1; /* GOOD */
+		pkt.quality = quality ? 1 : 0;
 		pkt.activity = NULL;
 		pkt.exertion = NULL;
 
@@ -403,18 +377,49 @@ static void infer_thread(void *a, void *b, void *c)
 	}
 }
 
+#if DT_NODE_HAS_STATUS(DT_NODELABEL(kinetiq_button), okay)
+#define KINETIQ_HAS_BUTTON_NODE 1
+static const struct gpio_dt_spec kinetiq_btn_spec =
+	GPIO_DT_SPEC_GET(DT_NODELABEL(kinetiq_button), gpios);
+#else
+#define KINETIQ_HAS_BUTTON_NODE 0
+#endif
+
 static void button_thread(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a);
 	ARG_UNUSED(b);
 	ARG_UNUSED(c);
 
-	LOG_INF("button_thread up: 100 Hz polled button FSM");
+	LOG_INF("button_thread up: 100 Hz polled button FSM (%s)",
+#if KINETIQ_HAS_BUTTON_NODE
+		"GPIO1 gpio-keys"
+#else
+		"simulated stub"
+#endif
+		);
 
 	while (1) {
 		bool raw_level = true;
 
+#if KINETIQ_HAS_BUTTON_NODE
+		/* gpio_pin_get_dt returns the LOGICAL level: 1 = pressed for
+		 * an ACTIVE_LOW button, 0 = released. button_fsm wants the
+		 * RAW electrical level: true = idle/high, false = pressed.
+		 * Hence raw_level = (logical == 0). Pull-up idle rests high.
+		 */
+		if (gpio_is_ready_dt(&kinetiq_btn_spec)) {
+			int v = gpio_pin_get_dt(&kinetiq_btn_spec);
+
+			if (v >= 0) {
+				raw_level = (v == 0);
+			}
+		}
+		/* Node missing or GPIO not ready falls through to the
+		 * simulated released level (true), same as the old stub. */
+#else
 		/* Raw GPIO read replaces this constant when the devicetree button binding lands. */
+#endif
 		button_event_t ev = button_fsm_tick(&g_button, raw_level, k_uptime_get());
 
 		if (ev == BUTTON_EVENT_SHORT_PRESS) {
@@ -494,10 +499,33 @@ static void comm_thread(void *a, void *b, void *c)
 int main(void)
 {
 	LOG_INF("KINETIQ firmware boot - Zephyr on ESP32-S3 (kernel %s)", KERNEL_VERSION_STRING);
-	LOG_INF("I2C0 400 kHz: BMI270@0x68 (imu_thread 100 Hz), MAX30102@0x57 (ppg_thread 50 Hz)");
-	LOG_INF("SPI2 40 MHz: GC9A01 (SCK=GPIO12, MOSI=GPIO11, CS=GPIO10, DC=GPIO14)");
+	LOG_INF("I2C0 400 kHz: SDA=GPIO4 SCL=GPIO5, BMI270@0x68 (imu_thread 100 Hz), MAX30102@0x57 (ppg_thread 50 Hz)");
+	LOG_INF("SPI2 40 MHz: GC9A01 (SCK=GPIO12, MOSI=GPIO11, CS=GPIO10, DC=GPIO9, RST=GPIO14, BL=GPIO13)");
+	LOG_INF("I2S0 reserved W4 audio: BCK=GPIO8 WS=GPIO7 RX_SD=GPIO6 TX_SD=GPIO17 (no SW use yet)");
+#if KINETIQ_HAS_BUTTON_NODE
+	LOG_INF("Button: KINETIQ PTT on GPIO1 (gpio-keys, active-low pull-up)");
+#else
+	LOG_INF("Button: simulated stub (no gpio-keys node)");
+#endif
 	LOG_INF("BLE NUS telemetry: name KINETIQ, newline-framed JSON notify, UART log fallback");
 	LOG_INF("Starting sensor, inference, display, button and communication threads");
+
+	sensor_imu_init();
+	sensor_ppg_init();
+	LOG_INF("IMU: %s",
+		sensor_imu_is_hardware_active() ? "BMI270 hardware" : "synthetic fallback");
+	LOG_INF("PPG: %s",
+		sensor_ppg_is_hardware_active() ? "MAX30102 hardware" : "synthetic fallback");
+
+#if KINETIQ_HAS_BUTTON_NODE
+	if (gpio_is_ready_dt(&kinetiq_btn_spec)) {
+		int brc = gpio_pin_configure_dt(&kinetiq_btn_spec, GPIO_INPUT);
+
+		if (brc != 0) {
+			LOG_WRN("PTT button GPIO config failed (%d), simulated reads", brc);
+		}
+	}
+#endif
 
 	button_fsm_init(&g_button, true, k_uptime_get());
 	display_engine_init();

@@ -3,33 +3,44 @@
  * Target: ESP32-S3-DevKitC-1 (n16r8), Zephyr `esp32s3_devkitc_n16r8`
  *
  * ---------------------------------------------------------------------------
- * PIN MAP (locked, keep clear of: GPIO0/GPIO3 strapping, GPIO45/GPIO46
- * strapping, GPIO19/GPIO20 native USB D-/D+, GPIO26..GPIO32 module flash+PSRAM)
+ * PIN MAP (FROZEN §11.2 freeze)
  * ---------------------------------------------------------------------------
  *   I2C0  (400 kHz, 4k7 external pull-ups, shared bus)
- *     SDA = GPIO8
- *     SCL = GPIO9
- *     BMI270  IMU   @ 0x68
- *     MAX30102 PPG  @ 0x57
+ *     SDA = GPIO4
+ *     SCL = GPIO5
+ *     BMI270  IMU   @ 0x68  (polled acquisition, no IRQ line)
+ *     MAX30102 PPG  @ 0x57  (polled acquisition, no IRQ line)
  *
  *   SPI2  (display bus, 40 MHz)
  *     SCK = GPIO12   (FSPI clock)
  *     MOSI = GPIO11  (FSPI data to panel)
- *     MISO = GPIO13  reserved, display is write-only (left unpopulated)
- *     CS  = GPIO10   (active low)
- *     DC  = GPIO14   (active low: command/data select)
- *     RST = GPIO21   (active low, panel reset)
- *     BL  = GPIO47   (LEDC PWM backlight, active high)
+ *     CS  = GPIO10   (active low, via cs-gpios, not pinctrl)
+ *     DC  = GPIO9    (active low: command/data select, plain GPIO)
+ *     RST = GPIO14   (active low, panel reset, plain GPIO)
+ *     BL  = GPIO13   (active high backlight enable, plain GPIO)
  *
- *   Direct GPIO (not on a serial bus)
- *     INT_BMI270 = GPIO4   (active high, data-ready)
- *     INT_MAX30102 = GPIO5 (active low)
- *     PTT mic I2S = GPIO6 (BCLK), GPIO15 (WS), GPIO16 (DOUT)
- *     Charging sense = GPIO17 (active low)
+ *   I2S0  (future W4 audio pair: INMP441 mic + MAX98357 amp, unused by SW)
+ *     BCK   = GPIO8   (bit clock)
+ *     WS    = GPIO7   (word select / LR clock)
+ *     RX_SD = GPIO6   (mic data in)
+ *     TX_SD = GPIO17  (amp data out)
+ *
+ *   Direct GPIO
+ *     KINETIQ PTT button = GPIO1 (active low, internal pull-up, gpio-keys)
+ *
+ * ---------------------------------------------------------------------------
+ * CONSTRAINT AUDIT
+ * ---------------------------------------------------------------------------
+ *   Constraint audit: pins used are 1, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+ *   13, 14, 17 - none are strapping (0, 3, 45, 46), USB (19, 20),
+ *   flash/PSRAM (26 to 32), or octal (33 to 37).
+ *   Freed by this remap: 15, 16, 21, 47 (GPIO4/5 reassigned from INT to I2C).
+ *   NOTE: differs from FINAL_BREAKDOWN.md §11.2 prose where the prose still
+ *   shows the older draft pins; this freeze section is authoritative.
  * ---------------------------------------------------------------------------
  */
 
-/* I2C0 pinmux: SDA = GPIO8, SCL = GPIO9, open-drain with internal pull-up
+/* I2C0 pinmux: SDA = GPIO4, SCL = GPIO5, open-drain with internal pull-up
  * enabled in addition to the 4k7 discrete pull-ups on the shared bus.
  */
 &pinctrl {
@@ -37,7 +48,7 @@
 		group-index = <0>;
 		drive-open-drain;
 		bias-pull-up;
-		pins = "GPIO8", "GPIO9";
+		pins = "GPIO4", "GPIO5";
 	};
 
 	i2c0_sleep: i2c0_sleep {
@@ -46,25 +57,44 @@
 		bias-pull-up;
 		lpsr-capable;
 		sleep-pin-in-suspend;
-		pins = "GPIO8", "GPIO9";
+		pins = "GPIO4", "GPIO5";
 	};
 
-	/* SPI2 pinmux: pin order SCK(GPIO12), MOSI(GPIO11), CS(GPIO10), DC(GPIO14). */
+	/* SPI2 pinmux: hardware SPI pins only, SCK(GPIO12), MOSI(GPIO11).
+	 * CS(GPIO10) is handled by cs-gpios, DC/RST/BL are plain GPIOs, so
+	 * they stay out of pinctrl.
+	 */
 	spi2_default: spi2_default {
 		group-index = <1>;
 		slew-rate;
-		pins = "GPIO12", "GPIO11", "GPIO10", "GPIO14";
+		pins = "GPIO12", "GPIO11";
 	};
 
 	spi2_sleep: spi2_sleep {
 		group-index = <1>;
 		lpsr-capable;
 		sleep-pin-in-suspend;
-		pins = "GPIO12", "GPIO11", "GPIO10", "GPIO14";
+		pins = "GPIO12", "GPIO11";
+	};
+
+	/* I2S0 pinmux: BCK(GPIO8), WS(GPIO7), RX_SD(GPIO6, mic data in),
+	 * TX_SD(GPIO17, amp data out). Reserved for the W4 audio pair;
+	 * no software thread uses I2S yet.
+	 */
+	i2s0_default: i2s0_default {
+		group-index = <2>;
+		pins = "GPIO8", "GPIO7", "GPIO6", "GPIO17";
+	};
+
+	i2s0_sleep: i2s0_sleep {
+		group-index = <2>;
+		lpsr-capable;
+		sleep-pin-in-suspend;
+		pins = "GPIO8", "GPIO7", "GPIO6", "GPIO17";
 	};
 };
 
-/* I2C0 controller: SDA = GPIO8, SCL = GPIO9 @ 400 kHz (I2C_BITRATE_FAST). */
+/* I2C0 controller: SDA = GPIO4, SCL = GPIO5 @ 400 kHz (I2C_BITRATE_FAST). */
 &i2c0 {
 	status = "okay";
 	clock-frequency = <I2C_BITRATE_FAST>;
@@ -73,20 +103,22 @@
 	pinctrl-1 = <&i2c0_sleep>;
 	pinctrl-names = "default", "sleep";
 
-	/* Bosch BMI270 6-axis IMU (accel + gyro), 400 kHz shared bus. */
+	/* Bosch BMI270 6-axis IMU (accel + gyro), 400 kHz shared bus.
+	 * Polled acquisition: GPIO4 is now SDA so there is no interrupt line.
+	 */
 	bmi270: bmi270@68 {
 		compatible = "bosch,bmi270";
 		reg = <0x68>;
 		label = "BMI270";
-		irq-gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
 	};
 
-	/* Maxim MAX30102 dual-LED PPG (red + IR), still-only SpO2 estimate. */
+	/* Maxim MAX30102 dual-LED PPG (red + IR), still-only SpO2 estimate.
+	 * Polled acquisition: GPIO5 is now SCL so there is no interrupt line.
+	 */
 	max30102: max30102@57 {
 		compatible = "maxim,max30102";
 		reg = <0x57>;
 		label = "MAX30102";
-		irq-gpios = <&gpio0 5 GPIO_ACTIVE_LOW>;
 	};
 };
 
@@ -111,13 +143,38 @@
 		round;
 		rotate = <0>;
 
-		dc-gpios = <&gpio0 14 GPIO_ACTIVE_LOW>;
-		reset-gpios = <&gpio0 21 GPIO_ACTIVE_LOW>;
+		dc-gpios = <&gpio0 9 GPIO_ACTIVE_LOW>;
+		reset-gpios = <&gpio0 14 GPIO_ACTIVE_LOW>;
 
 		/*
-		 * Backlight is a plain LEDC PWM channel on GPIO47, driven from
-		 * TIMER0 LEDC channel 0 in firmware (display_dim()/display_wake()).
+		 * Backlight is a plain active-high GPIO on GPIO13, driven
+		 * from firmware (display_dim()/display_wake()).
 		 */
-		backlight-gpios = <&gpio1 47 GPIO_ACTIVE_HIGH>;
+		backlight-gpios = <&gpio0 13 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+/* I2S0 controller: BCK = GPIO8, WS = GPIO7, RX_SD = GPIO6, TX_SD = GPIO17.
+ * Pinned out for the future W4 INMP441/MAX98357 audio pair; nothing in
+ * software configures or streams I2S yet.
+ */
+&i2s0 {
+	status = "okay";
+
+	pinctrl-0 = <&i2s0_default>;
+	pinctrl-1 = <&i2s0_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+/* User button on GPIO1 via gpio-keys so GPIO_DT_SPEC_GET on
+ * DT_NODELABEL(kinetiq_button) resolves in firmware.
+ */
+{
+	buttons {
+		compatible = "gpio-keys";
+		kinetiq_button: kinetiq_button {
+			gpios = <&gpio0 1 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			label = "KINETIQ PTT";
+		};
 	};
 };
