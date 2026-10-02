@@ -1,4 +1,4 @@
 cmake_minimum_required(VERSION 3.20.0)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(kinetiq_firmware)
-target_sources(app PRIVATE src/main.c src/button_fsm.c src/activity_engine.c src/display_engine.c)
+target_sources(app PRIVATE src/main.c src/button_fsm.c src/activity_engine.c src/display_engine.c src/ble_transport.c)

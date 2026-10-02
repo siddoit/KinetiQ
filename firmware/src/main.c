@@ -5,6 +5,8 @@
  * Process   : k_msgq sample bus feeding infer_thread
  * Infer     : activity_engine classifier (REST/WALK/RUN) + exertion + PPG quality gate
  * Communicate: comm_thread (1 Hz) emitting the locked telemetry JSON
+ *             over BLE NUS notify (newline-framed) with the UART LOG_INF
+ *             line kept as the debug fallback when no peer is connected
  * UI        : button_thread (100 Hz) polling button_fsm for PTT events;
  *             display_engine owns the canonical screen state plus the
  *             240x240 round GC9A01 ASCII-grid preview (short-press cycles it,
@@ -23,6 +25,7 @@
 #include "button_fsm.h"
 #include "activity_engine.h"
 #include "display_engine.h"
+#include "ble_transport.h"
 
 LOG_MODULE_REGISTER(kinetiq, LOG_LEVEL_INF);
 
@@ -115,6 +118,22 @@ static struct k_thread button_tid;
 
 static button_fsm_t g_button;
 static bool s_ptt_active = false;
+
+static void on_laptop_rx(const uint8_t *data, size_t len)
+{
+	char excerpt[65];
+	size_t shown = len > 64U ? 64U : len;
+	size_t i;
+
+	for (i = 0; i < shown; i++) {
+		uint8_t ch = data[i];
+
+		excerpt[i] = (ch >= 32U && ch < 127U) ? (char)ch : '.';
+	}
+	excerpt[shown] = '\0';
+	LOG_INF("laptop rx %u byte(s): %s%s (assistant audio/commands landing point, PTT downlink wired in W4)",
+		(unsigned int)len, excerpt, len > 64U ? "..." : "");
+}
 
 static void queue_packet(sensor_packet_t *pkt)
 {
@@ -458,6 +477,16 @@ static void comm_thread(void *a, void *b, void *c)
 
 		LOG_INF("%s", json_buf);
 
+		if (ble_transport_is_connected()) {
+			int brc = ble_transport_send_telemetry(json_buf, strlen(json_buf));
+
+			if (brc < 0) {
+				LOG_WRN("BLE tx failed: %d", brc);
+			}
+		} else {
+			LOG_DBG("BLE not connected, UART log only");
+		}
+
 		k_msleep(COMM_PERIOD_MS);
 	}
 }
@@ -467,11 +496,23 @@ int main(void)
 	LOG_INF("KINETIQ firmware boot - Zephyr on ESP32-S3 (kernel %s)", KERNEL_VERSION_STRING);
 	LOG_INF("I2C0 400 kHz: BMI270@0x68 (imu_thread 100 Hz), MAX30102@0x57 (ppg_thread 50 Hz)");
 	LOG_INF("SPI2 40 MHz: GC9A01 (SCK=GPIO12, MOSI=GPIO11, CS=GPIO10, DC=GPIO14)");
+	LOG_INF("BLE NUS telemetry: name KINETIQ, newline-framed JSON notify, UART log fallback");
 	LOG_INF("Starting sensor, inference, display, button and communication threads");
 
 	button_fsm_init(&g_button, true, k_uptime_get());
 	display_engine_init();
 	LOG_INF("display_engine up: HOME screen, 240x240 round GC9A01 grid");
+
+	ble_transport_register_rx_callback(on_laptop_rx);
+	{
+		int rc = ble_transport_init();
+
+		if (rc != 0) {
+			LOG_WRN("BLE init failed (%d), UART telemetry only", rc);
+		} else {
+			LOG_INF("BLE up: name KINETIQ, NUS advertising");
+		}
+	}
 
 	k_thread_create(&imu_tid, imu_stack, THREAD_STACK_SIZE,
 			imu_thread, NULL, NULL, NULL, IMU_PRIO, 0, K_NO_WAIT);
