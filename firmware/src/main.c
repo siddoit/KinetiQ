@@ -3,8 +3,9 @@
  *
  * Sense     : imu_thread (100 Hz, BMI270) + ppg_thread (50 Hz, MAX30102)
  * Process   : k_msgq sample bus feeding infer_thread
- * Infer     : rule-based activity (REST/WALK/RUN) + exertion + PPG quality gate
+ * Infer     : activity_engine classifier (REST/WALK/RUN) + exertion + PPG quality gate
  * Communicate: comm_thread (1 Hz) emitting the locked telemetry JSON
+ * UI        : button_thread (100 Hz) polling button_fsm for screen/PTT events
  */
 
 #include <zephyr/kernel.h>
@@ -14,6 +15,10 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+
+#include "sensor_packet.h"
+#include "button_fsm.h"
+#include "activity_engine.h"
 
 LOG_MODULE_REGISTER(kinetiq, LOG_LEVEL_INF);
 
@@ -31,21 +36,12 @@ LOG_MODULE_REGISTER(kinetiq, LOG_LEVEL_INF);
 #define IMU_PRIO 5
 #define PPG_PRIO 6
 #define INFER_PRIO 7
+#define BUTTON_PRIO 8
 #define COMM_PRIO 9
 
 #define THREAD_STACK_SIZE 2048
-
-/* Activity thresholds on the EMA of blended motion energy (g / rad-per-s). */
-#define ENERGY_REST_MAX 0.60f
-#define ENERGY_WALK_MAX 1.80f
-
-/* Energy is mapped to a normalised 0.00-1.00 intensity for the JSON schema. */
-#define ENERGY_INTENSITY_FS 3.00f
-
-/* Exertion thresholds on heart rate (bpm). */
-#define HR_REST_MAX 80
-#define HR_LIGHT_MAX 100
-#define HR_MODERATE_MAX 130
+#define BUTTON_STACK_SIZE 1024
+#define BUTTON_PERIOD_MS 10
 
 /* Synthetic PPG waveform operating point (raw MAX30102-ish ADC counts). */
 #define PPG_RED_DC 40000.0f
@@ -60,19 +56,6 @@ LOG_MODULE_REGISTER(kinetiq, LOG_LEVEL_INF);
 
 /* Step detector refractory window. */
 #define STEP_REFRACTORY_MS 250
-
-typedef struct {
-	int64_t timestamp_ms;
-	float accel_x, accel_y, accel_z;
-	float gyro_x, gyro_y, gyro_z;
-	uint16_t ppg_red;
-	uint32_t ppg_ir;
-	uint16_t heart_rate;
-	uint32_t steps;
-	uint8_t quality;   /* 0 = POOR, 1 = GOOD */
-	const char *activity;   /* REST / WALK / RUN */
-	const char *exertion;   /* REST / LIGHT / MODERATE / HIGH */
-} sensor_packet_t;
 
 struct shared_state {
 	int64_t timestamp_ms;
@@ -112,16 +95,28 @@ static void imu_thread(void *a, void *b, void *c);
 static void ppg_thread(void *a, void *b, void *c);
 static void infer_thread(void *a, void *b, void *c);
 static void comm_thread(void *a, void *b, void *c);
+static void button_thread(void *a, void *b, void *c);
 
 K_THREAD_STACK_DEFINE(imu_stack, THREAD_STACK_SIZE);
 K_THREAD_STACK_DEFINE(ppg_stack, THREAD_STACK_SIZE);
 K_THREAD_STACK_DEFINE(infer_stack, THREAD_STACK_SIZE);
 K_THREAD_STACK_DEFINE(comm_stack, THREAD_STACK_SIZE);
+K_THREAD_STACK_DEFINE(button_stack, BUTTON_STACK_SIZE);
 
 static struct k_thread imu_tid;
 static struct k_thread ppg_tid;
 static struct k_thread infer_tid;
 static struct k_thread comm_tid;
+static struct k_thread button_tid;
+
+static button_fsm_t g_button;
+
+static const char *const screen_names[] = {
+	"HOME",
+	"ACTIVITY",
+	"BODY",
+	"ASSISTANT",
+};
 
 static void queue_packet(sensor_packet_t *pkt)
 {
@@ -285,10 +280,12 @@ static void infer_thread(void *a, void *b, void *c)
 	ARG_UNUSED(c);
 
 	sensor_packet_t pkt;
-	float energy_ema = 0.0f;
+	activity_engine_t eng;
 	uint16_t last_hr = 72;
 	uint8_t last_quality = 0;
 	uint32_t last_steps = 0;
+
+	activity_engine_init(&eng);
 
 	LOG_INF("infer_thread up: rule-based activity/exertion inference");
 
@@ -301,44 +298,9 @@ static void infer_thread(void *a, void *b, void *c)
 						 (pkt.ppg_ir >= (uint32_t)PPG_IR_FLOOR) ? 1 : 0);
 		}
 
-		float mag = sqrtf((pkt.accel_x * pkt.accel_x) +
-				  (pkt.accel_y * pkt.accel_y) +
-				  (pkt.accel_z * pkt.accel_z));
-		float dev = fabsf(mag - 9.81f);
-		float gyro_mag = sqrtf((pkt.gyro_x * pkt.gyro_x) +
-				       (pkt.gyro_y * pkt.gyro_y) +
-				       (pkt.gyro_z * pkt.gyro_z));
-		float energy = (0.7f * dev) + (0.3f * gyro_mag);
-
-		energy_ema = (0.90f * energy_ema) + (0.10f * energy);
-
-		const char *activity;
-		if (energy_ema < ENERGY_REST_MAX) {
-			activity = "REST";
-		} else if (energy_ema < ENERGY_WALK_MAX) {
-			activity = "WALK";
-		} else {
-			activity = "RUN";
-		}
-
-		const char *exertion;
-		if ((last_hr < HR_REST_MAX) && (strcmp(activity, "REST") == 0)) {
-			exertion = "REST";
-		} else if (last_hr < HR_LIGHT_MAX) {
-			exertion = "LIGHT";
-		} else if (last_hr < HR_MODERATE_MAX) {
-			exertion = "MODERATE";
-		} else {
-			exertion = "HIGH";
-		}
-
-		float intensity = energy_ema / ENERGY_INTENSITY_FS;
-		if (intensity < 0.0f) {
-			intensity = 0.0f;
-		}
-		if (intensity > 1.0f) {
-			intensity = 1.0f;
-		}
+		const char *activity = activity_engine_update(&eng, &pkt);
+		float intensity = activity_engine_motion_intensity(&eng);
+		const char *exertion = activity_engine_exertion(&eng, last_hr, activity);
 
 		last_steps = pkt.steps;
 		atomic_inc(&g_processed_packets);
@@ -353,6 +315,34 @@ static void infer_thread(void *a, void *b, void *c)
 		snprintk(current_state.activity, sizeof(current_state.activity), "%s", activity);
 		snprintk(current_state.exertion, sizeof(current_state.exertion), "%s", exertion);
 		k_mutex_unlock(&state_mutex);
+	}
+}
+
+static void button_thread(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a);
+	ARG_UNUSED(b);
+	ARG_UNUSED(c);
+
+	LOG_INF("button_thread up: 100 Hz polled button FSM");
+
+	while (1) {
+		bool raw_level = true;
+
+		/* Raw GPIO read replaces this constant when the devicetree button binding lands. */
+		button_event_t ev = button_fsm_tick(&g_button, raw_level, k_uptime_get());
+
+		if (ev == BUTTON_EVENT_SHORT_PRESS) {
+			ui_screen_t scr = button_fsm_on_short_press(&g_button);
+
+			LOG_INF("UI screen -> %s (%d)", screen_names[scr], (int)scr);
+		} else if (ev == BUTTON_EVENT_LONG_PRESS_START) {
+			LOG_INF("PTT capture armed");
+		} else if (ev == BUTTON_EVENT_LONG_PRESS_END) {
+			LOG_INF("PTT capture released");
+		}
+
+		k_msleep(BUTTON_PERIOD_MS);
 	}
 }
 
@@ -399,7 +389,9 @@ int main(void)
 	LOG_INF("KINETIQ firmware boot - Zephyr on ESP32-S3 (kernel %s)", KERNEL_VERSION_STRING);
 	LOG_INF("I2C0 400 kHz: BMI270@0x68 (imu_thread 100 Hz), MAX30102@0x57 (ppg_thread 50 Hz)");
 	LOG_INF("SPI2 40 MHz: GC9A01 (SCK=GPIO12, MOSI=GPIO11, CS=GPIO10, DC=GPIO14)");
-	LOG_INF("Starting sensor and communication threads");
+	LOG_INF("Starting sensor, inference, button and communication threads");
+
+	button_fsm_init(&g_button, true, k_uptime_get());
 
 	k_thread_create(&imu_tid, imu_stack, THREAD_STACK_SIZE,
 			imu_thread, NULL, NULL, NULL, IMU_PRIO, 0, K_NO_WAIT);
@@ -409,11 +401,14 @@ int main(void)
 			infer_thread, NULL, NULL, NULL, INFER_PRIO, 0, K_NO_WAIT);
 	k_thread_create(&comm_tid, comm_stack, THREAD_STACK_SIZE,
 			comm_thread, NULL, NULL, NULL, COMM_PRIO, 0, K_NO_WAIT);
+	k_thread_create(&button_tid, button_stack, BUTTON_STACK_SIZE,
+			button_thread, NULL, NULL, NULL, BUTTON_PRIO, 0, K_NO_WAIT);
 
 	k_thread_name_set(&imu_tid, "imu_thread");
 	k_thread_name_set(&ppg_tid, "ppg_thread");
 	k_thread_name_set(&infer_tid, "infer_thread");
 	k_thread_name_set(&comm_tid, "comm_thread");
+	k_thread_name_set(&button_tid, "button_thread");
 
 	return 0;
 }
