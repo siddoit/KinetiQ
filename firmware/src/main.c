@@ -5,7 +5,10 @@
  * Process   : k_msgq sample bus feeding infer_thread
  * Infer     : activity_engine classifier (REST/WALK/RUN) + exertion + PPG quality gate
  * Communicate: comm_thread (1 Hz) emitting the locked telemetry JSON
- * UI        : button_thread (100 Hz) polling button_fsm for screen/PTT events
+ * UI        : button_thread (100 Hz) polling button_fsm for PTT events;
+ *             display_engine owns the canonical screen state plus the
+ *             240x240 round GC9A01 ASCII-grid preview (short-press cycles it,
+ *             infer_thread feeds it telemetry, button long-press drives PTT)
  */
 
 #include <zephyr/kernel.h>
@@ -19,6 +22,7 @@
 #include "sensor_packet.h"
 #include "button_fsm.h"
 #include "activity_engine.h"
+#include "display_engine.h"
 
 LOG_MODULE_REGISTER(kinetiq, LOG_LEVEL_INF);
 
@@ -110,13 +114,7 @@ static struct k_thread comm_tid;
 static struct k_thread button_tid;
 
 static button_fsm_t g_button;
-
-static const char *const screen_names[] = {
-	"HOME",
-	"ACTIVITY",
-	"BODY",
-	"ASSISTANT",
-};
+static bool s_ptt_active = false;
 
 static void queue_packet(sensor_packet_t *pkt)
 {
@@ -273,6 +271,50 @@ static void ppg_thread(void *a, void *b, void *c)
 	}
 }
 
+static char s_display_grid[DISPLAY_GRID_MIN_LEN];
+
+/* Compact preview policy: one LOG_INF summary per event plus the full
+ * 240-row grid at LOG_DBG in 30-row chunks, so frequent telemetry updates
+ * stay readable while debug sessions still get every cell. The grid buffer
+ * is file-scope BSS (57 KB), never thread stack. Chunk logging borrows a
+ * save/restore NUL trick on the grid itself to avoid a second big buffer.
+ */
+static void log_display_preview(const char *why)
+{
+	struct shared_state snap;
+
+	display_engine_render_ascii(s_display_grid, sizeof(s_display_grid));
+
+	k_mutex_lock(&state_mutex, K_FOREVER);
+	snap = current_state;
+	k_mutex_unlock(&state_mutex);
+
+	LOG_INF("display preview (%s): screen=%s ptt=%d hr=%u steps=%u act=%s ex=%s qual=%s",
+		why,
+		display_engine_screen_name(display_engine_current_screen()),
+		(int)s_ptt_active,
+		(unsigned int)snap.heart_rate,
+		(unsigned int)snap.steps,
+		snap.activity,
+		snap.exertion,
+		(snap.quality != 0U) ? "good" : "poor");
+
+	for (int base = 0; base < DISPLAY_HEIGHT; base += 30) {
+		size_t off = (size_t)base * ((size_t)DISPLAY_WIDTH + 1U);
+		size_t len = (size_t)30 * ((size_t)DISPLAY_WIDTH + 1U);
+		char saved;
+
+		if (off + len > sizeof(s_display_grid) - 1U) {
+			len = sizeof(s_display_grid) - 1U - off;
+		}
+
+		saved = s_display_grid[off + len];
+		s_display_grid[off + len] = '\0';
+		LOG_DBG("%s", &s_display_grid[off]);
+		s_display_grid[off + len] = saved;
+	}
+}
+
 static void infer_thread(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a);
@@ -284,6 +326,8 @@ static void infer_thread(void *a, void *b, void *c)
 	uint16_t last_hr = 72;
 	uint8_t last_quality = 0;
 	uint32_t last_steps = 0;
+	static char prev_activity[12] = "";
+	static char prev_exertion[12] = "";
 
 	activity_engine_init(&eng);
 
@@ -315,6 +359,28 @@ static void infer_thread(void *a, void *b, void *c)
 		snprintk(current_state.activity, sizeof(current_state.activity), "%s", activity);
 		snprintk(current_state.exertion, sizeof(current_state.exertion), "%s", exertion);
 		k_mutex_unlock(&state_mutex);
+
+		/* Feed the display engine outside the mutex (it owns its state).
+		 * Called for every packet: PPG packets carry hr/quality, IMU and
+		 * PPG packets both carry the running step count. SpO2 is the
+		 * constant 97 per the current schema; the setter call keeps the
+		 * wiring real for when the schema gains a SpO2 field. */
+		display_engine_update_telemetry(&pkt, activity, exertion);
+		display_engine_set_spo2(97);
+
+		{
+			int64_t up_ms = k_uptime_get();
+			long sod = (long)((KINETIQ_EPOCH_BASE_S + (up_ms / 1000)) % 86400LL);
+
+			display_engine_set_time((int)(sod / 3600), (int)((sod / 60) % 60));
+		}
+
+		if (strcmp(prev_activity, activity) != 0 ||
+		    strcmp(prev_exertion, exertion) != 0) {
+			snprintk(prev_activity, sizeof(prev_activity), "%s", activity);
+			snprintk(prev_exertion, sizeof(prev_exertion), "%s", exertion);
+			log_display_preview("infer_change");
+		}
 	}
 }
 
@@ -333,13 +399,25 @@ static void button_thread(void *a, void *b, void *c)
 		button_event_t ev = button_fsm_tick(&g_button, raw_level, k_uptime_get());
 
 		if (ev == BUTTON_EVENT_SHORT_PRESS) {
-			ui_screen_t scr = button_fsm_on_short_press(&g_button);
+			/* button_fsm keeps its own internal screen index for FSM
+			 * unit-test parity, but display_engine is the canonical UI
+			 * state, so short-press cycles the display engine here and
+			 * button_fsm_on_short_press() is intentionally not called. */
+			display_engine_cycle_screen();
 
-			LOG_INF("UI screen -> %s (%d)", screen_names[scr], (int)scr);
+			LOG_INF("UI screen -> %s",
+				display_engine_screen_name(display_engine_current_screen()));
+			log_display_preview("short_press");
 		} else if (ev == BUTTON_EVENT_LONG_PRESS_START) {
+			display_engine_set_ptt_active(true);
+			s_ptt_active = true;
 			LOG_INF("PTT capture armed");
+			log_display_preview("ptt_start");
 		} else if (ev == BUTTON_EVENT_LONG_PRESS_END) {
+			display_engine_set_ptt_active(false);
+			s_ptt_active = false;
 			LOG_INF("PTT capture released");
+			log_display_preview("ptt_end");
 		}
 
 		k_msleep(BUTTON_PERIOD_MS);
@@ -389,9 +467,11 @@ int main(void)
 	LOG_INF("KINETIQ firmware boot - Zephyr on ESP32-S3 (kernel %s)", KERNEL_VERSION_STRING);
 	LOG_INF("I2C0 400 kHz: BMI270@0x68 (imu_thread 100 Hz), MAX30102@0x57 (ppg_thread 50 Hz)");
 	LOG_INF("SPI2 40 MHz: GC9A01 (SCK=GPIO12, MOSI=GPIO11, CS=GPIO10, DC=GPIO14)");
-	LOG_INF("Starting sensor, inference, button and communication threads");
+	LOG_INF("Starting sensor, inference, display, button and communication threads");
 
 	button_fsm_init(&g_button, true, k_uptime_get());
+	display_engine_init();
+	LOG_INF("display_engine up: HOME screen, 240x240 round GC9A01 grid");
 
 	k_thread_create(&imu_tid, imu_stack, THREAD_STACK_SIZE,
 			imu_thread, NULL, NULL, NULL, IMU_PRIO, 0, K_NO_WAIT);
