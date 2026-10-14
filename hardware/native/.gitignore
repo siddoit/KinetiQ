@@ -1,0 +1,4 @@
+# KINETIQ native simulator: kernel source + build outputs stay local.
+freertos-kernel/
+*.exe
+*.o
