@@ -9,6 +9,7 @@
 # PIN PLAN (docs/OVERHAUL_PLAN.md section 3, locked — plan wins over guesses):
 #   I2C SDA=21 / SCL=22 (MPU6050 @ 0x68, AD0->GND) | DHT22=GPIO13
 #   button=GPIO4 (INPUT_PULLUP) | buzzer=GPIO17 | status LED=GPIO16 (via 220R)
+#   examiner trimpot (wokwi-potentiometer SIG)=GPIO34 (ADC1_CH6, input-only)
 # Strapping pins 0/2/12/15 and 1/3 (UART), 6-11 (flash) deliberately avoided.
 #
 # PART-ID VERIFICATION (wokwi.com/docs/parts + live diagram.json examples):
@@ -20,6 +21,10 @@
 #                             contact pins as wokwi-pushbutton — see Risks)
 #   wokwi-led               : VERIFIED (pins A=anode, C=cathode)
 #   wokwi-resistor          : VERIFIED (pins 1/2; 220 ohm LED series resistor)
+#   wokwi-potentiometer     : VERIFIED (docs.wokwi.com/parts/wokwi-potentiometer,
+#                             pins GND/SIG/VCC; SIG -> analog input). NOTE: no
+#                             "wokwi-trimpot" part exists in the registry — the
+#                             potentiometer is the verified equivalent knob.
 
 version = 1
 author = "KINETIQ team"
@@ -84,6 +89,14 @@ top = -180
 
 [parts.attrs]
 value = 220
+
+[[parts]]
+id = "pot1"
+type = "wokwi-potentiometer"
+left = 200
+top = 160
+
+[parts.attrs]
 
 # --- connections: { from = "part:pin", to = "part:pin", color } ---
 
@@ -161,3 +174,18 @@ color = "green"
 from = "led1:C"
 to = "esp:GND.1"
 color = "black"
+
+[[connections]]
+from = "esp:3V3"
+to = "pot1:VCC"
+color = "red"
+
+[[connections]]
+from = "esp:GND.1"
+to = "pot1:GND"
+color = "black"
+
+[[connections]]
+from = "esp:34"
+to = "pot1:SIG"
+color = "blue"

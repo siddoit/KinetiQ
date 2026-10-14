@@ -18,10 +18,25 @@ Browser-only ESP32 "hardware" for the demo. Real FreeRTOS firmware
 **Expected output:** one JSON line per second, e.g.
 `{"timestamp":1727544001,"heart_rate":73,"spo2":97,"activity":"rest",
 "motion_intensity":0.01,"exertion":"rest","steps":0,"ppg_quality":"good"}`
-Click the red button (`btn1`) in the canvas → buzzer beeps + green LED switches
-to fast blink. Wokwi `wokwi-mpu6050` is static, so `activity` stays `rest`
-unless you edit the part`s accel attributes (classification thresholds are live
-in code and trigger on real hardware).
+Each JSON line is preceded by a plain-text RTOS status line, e.g.
+`RTOS tick=12345 tasks=6 uptime_s=12 heap=31204` (never JSON — parsers that
+keep only lines starting with `{` skip it automatically).
+
+## Examiner controls (live in the browser sim)
+
+- **Activity knob (`pot1`, wired to GPIO34):** drag the potentiometer to drive
+  the activity state — left third → `rest`, middle third → `walk` (HR ~96,
+  steps tick up), right third → `run` (HR ~132, steps tick faster). The Wokwi
+  MPU6050 is static, so without the knob everything would sit at `rest`.
+- **Red button (`btn1`) = fall event:** one press → short double-beep,
+  `motion_intensity` spikes to ~0.95 with `activity` forced to `rest`
+  (`fall` is NOT a valid schema value — see `laptop/receiver/telemetry_schema.py`,
+  so the incident is encoded as `rest` + high intensity + `exertion: high`),
+  then an ~8 s recovery ramp: HR spikes (~+30 bpm) and decays while intensity
+  eases back to the knob baseline. Green LED + buzzer acknowledge as before.
+- **RTOS status line:** `RTOS tick=<ticks> tasks=6 uptime_s=<s> heap=<bytes>`,
+  once per second before the JSON line. Task priorities/periods/stacks live in
+  the `RTOS CONFIG` block at the top of `sketch.ino` — point examiners at it.
 
 ## Fallback — VS Code + Wokwi extension
 
@@ -48,6 +63,9 @@ python -c "import tomllib,json;d=tomllib.load(open('diagram.toml','rb'));json.du
 | 17 | `bz1:2` (+) | green | `tone()` beep |
 | 4 | `btn1:1.r` | green | INPUT_PULLUP, active LOW |
 | 16 → 220R → `led1:A` | `r1:1`→`r1:2`→`led1:A` | green | status LED |
+| 34 | `pot1:SIG` | blue | examiner activity knob (ADC1, input-only) |
+| 3V3 | `pot1:VCC` | red | knob supply |
+| GND.1 | `pot1:GND` | black | knob ground |
 
 ## Honest scope note
 
@@ -70,7 +88,8 @@ no PPG sensor in the razor BOM).
     { "id": "bz1", "type": "wokwi-buzzer", "left": 200, "top": 60, "attrs": {} },
     { "id": "btn1", "type": "wokwi-pushbutton-6mm", "left": 200, "top": -80, "attrs": { "label": "ALERT", "color": "red" } },
     { "id": "led1", "type": "wokwi-led", "left": 200, "top": -180, "attrs": { "color": "green" } },
-    { "id": "r1", "type": "wokwi-resistor", "left": 110, "top": -180, "attrs": { "value": 220 } }
+    { "id": "r1", "type": "wokwi-resistor", "left": 110, "top": -180, "attrs": { "value": 220 } },
+    { "id": "pot1", "type": "wokwi-potentiometer", "left": 200, "top": 160, "attrs": {} }
   ],
   "connections": [
     [ "esp:21", "imu1:SDA", "green", [] ],
@@ -87,7 +106,10 @@ no PPG sensor in the razor BOM).
     [ "esp:GND.1", "btn1:2.r", "black", [] ],
     [ "esp:16", "r1:1", "green", [] ],
     [ "r1:2", "led1:A", "green", [] ],
-    [ "led1:C", "esp:GND.1", "black", [] ]
+    [ "led1:C", "esp:GND.1", "black", [] ],
+    [ "esp:3V3", "pot1:VCC", "red", [] ],
+    [ "esp:GND.1", "pot1:GND", "black", [] ],
+    [ "esp:34", "pot1:SIG", "blue", [] ]
   ],
   "dependencies": {}
 }
