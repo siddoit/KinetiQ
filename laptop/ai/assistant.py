@@ -291,7 +291,8 @@ class AIAdvisor:
         try:
             resp = requests.post(
                 self.ollama_url,
-                json={"model": self.model, "prompt": prompt, "stream": False},
+                json={"model": self.model, "prompt": prompt, "stream": False,
+                      "options": {"temperature": 0, "num_predict": 220}},
                 timeout=self.timeout,
             )
             resp.raise_for_status()

@@ -73,6 +73,17 @@ Demo notes:
   automatically falls back to the template backend instead of failing.
 - Wokwi simulation: open `hardware/sim/sketch.ino` + `diagram.toml` in the
   browser editor — full steps in `hardware/sim/README.md`.
+- Native device node (no browser): build once via `hardware\native\build.ps1`,
+  then pipe live RTOS telemetry into the dashboard — see below.
+
+### Local device node
+
+Real FreeRTOS v11 kernel on the Windows simulator port (keys 1/2/3/b/0),
+stdout = 1 Hz JSON telemetry, stderr = RTOS status. Live pipe:
+
+```bat
+hardware\native\kinetiq_native.exe | laptop\.venv\Scripts\python.exe laptop\receiver\dashboard.py --source stdin --headless
+```
 
 Expected outputs (so you know a run is healthy):
 
@@ -132,6 +143,7 @@ Keep clear: GPIO1/3 (USB-UART), 6–11 (flash), 0/2/12/15 (strapping).
 laptop/          receiver (dashboard, mock_streamer, ble_client) + ai (assistant, voice_pipeline)
 firmware/        legacy Zephyr tree — de-scoped, reference only
 hardware/sim/    Wokwi browser simulation (sketch.ino + diagram.toml + README)
+hardware/native/ Native FreeRTOS v11 device node (Windows sim port, keyboard-driven, pipes to dashboard)
 docs/            report (docs/report/report.md | .docx), slides
                  (docs/final review/KINETIQ_V1_final_review.pptx),
                  pivot plan (docs/OVERHAUL_PLAN.md),

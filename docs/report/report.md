@@ -360,6 +360,15 @@ with a recorded backup video. The Huawei band-bridge probe for HR/SpO₂ is
 strictly timeboxed (10-minute nRF Connect scan for a readable Heart Rate
 service 0x180D; park it if bonded/encrypted, as expected).
 
+### 7.4 Native RTOS simulation
+
+Alongside the Wokwi browser sim, a native device node (`hardware/native/`)
+runs the real FreeRTOS v11 kernel on the Windows simulator port —
+keyboard-driven (1/2/3/b/0), printing RTOS status plus 1 Hz JSON telemetry
+that pipes straight into the dashboard. Timing is best-effort (Windows is
+not hard-RT), but kernel semantics are genuine; it stands in for the
+wristboard until parts arrive.
+
 ---
 
 ## 8. Testing & Results
