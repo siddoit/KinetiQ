@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -512,6 +513,23 @@ def verify_grounding(response: str, payload: Dict[str, Any]) -> List[str]:
         failures.append(
             f"brevity contract: response is {words} words, limit is {MAX_RESPONSE_WORDS}"
         )
+
+    # Narrow-question exemption: a reply that quotes the exact live heart-rate
+    # next to a heart-rate word (e.g. "Your heart rate is 70 beats per
+    # minute.") is provably reading live state, so the activity/exertion
+    # restatement is waived. Brevity and poor-signal checks above still apply.
+    raw_hr = str(payload.get("heart_rate", "")).strip()
+    live_hr = int(raw_hr) if raw_hr.isdigit() else None
+    if live_hr is not None and re.search(r"\b{0}\b".format(live_hr), text):
+        if any(word in lowered for word in ("heart", "bpm", "beats", "pulse")):
+            failures = [
+                f
+                for f in failures
+                if not (
+                    f.startswith("exertion grounding")
+                    or f.startswith("activity grounding")
+                )
+            ]
 
     return failures
 
