@@ -1,0 +1,163 @@
+# KINETIQ — Wokwi simulation wiring source of truth.
+# File: hardware/sim/diagram.toml
+#
+# HOW TO USE: the Wokwi online editor consumes diagram.json. This TOML file is
+# the version-controlled source (TOML is hand-editable + tomllib-validated).
+# Convert with the one-liner in README.md, then paste the resulting JSON into
+# the editor's diagram.json tab. Field mapping is 1:1 (parts[] + connections[]).
+#
+# PIN PLAN (docs/OVERHAUL_PLAN.md section 3, locked — plan wins over guesses):
+#   I2C SDA=21 / SCL=22 (MPU6050 @ 0x68, AD0->GND) | DHT22=GPIO13
+#   button=GPIO4 (INPUT_PULLUP) | buzzer=GPIO17 | status LED=GPIO16 (via 220R)
+# Strapping pins 0/2/12/15 and 1/3 (UART), 6-11 (flash) deliberately avoided.
+#
+# PART-ID VERIFICATION (wokwi.com/docs/parts + live diagram.json examples):
+#   board-esp32-devkit-c-v4 : VERIFIED (official ESP32 DevKitC V4 board id)
+#   wokwi-mpu6050           : VERIFIED (pins VCC/GND/SCL/SDA/AD0/INT)
+#   wokwi-dht22             : VERIFIED (pins VCC/SDA=data/NC/GND)
+#   wokwi-buzzer            : VERIFIED (pin 1=neg/GND, pin 2=pos; tone()-driven)
+#   wokwi-pushbutton-6mm    : VERIFIED (exists in diagram reference; same 1.x/2.x
+#                             contact pins as wokwi-pushbutton — see Risks)
+#   wokwi-led               : VERIFIED (pins A=anode, C=cathode)
+#   wokwi-resistor          : VERIFIED (pins 1/2; 220 ohm LED series resistor)
+
+version = 1
+author = "KINETIQ team"
+editor = "wokwi"
+
+[[parts]]
+id = "esp"
+type = "board-esp32-devkit-c-v4"
+left = 0
+top = 0
+
+[parts.attrs]
+
+[[parts]]
+id = "imu1"
+type = "wokwi-mpu6050"
+left = -180
+top = 80
+
+[parts.attrs]
+
+[[parts]]
+id = "dht1"
+type = "wokwi-dht22"
+left = -180
+top = -120
+
+[parts.attrs]
+
+[[parts]]
+id = "bz1"
+type = "wokwi-buzzer"
+left = 200
+top = 60
+
+[parts.attrs]
+
+[[parts]]
+id = "btn1"
+type = "wokwi-pushbutton-6mm"
+left = 200
+top = -80
+
+[parts.attrs]
+label = "ALERT"
+color = "red"
+
+[[parts]]
+id = "led1"
+type = "wokwi-led"
+left = 200
+top = -180
+
+[parts.attrs]
+color = "green"
+
+[[parts]]
+id = "r1"
+type = "wokwi-resistor"
+left = 110
+top = -180
+
+[parts.attrs]
+value = 220
+
+# --- connections: { from = "part:pin", to = "part:pin", color } ---
+
+[[connections]]
+from = "esp:21"
+to = "imu1:SDA"
+color = "green"
+
+[[connections]]
+from = "esp:22"
+to = "imu1:SCL"
+color = "yellow"
+
+[[connections]]
+from = "esp:3V3"
+to = "imu1:VCC"
+color = "red"
+
+[[connections]]
+from = "esp:GND.1"
+to = "imu1:GND"
+color = "black"
+
+[[connections]]
+from = "esp:GND.2"
+to = "imu1:AD0"
+color = "black"
+
+[[connections]]
+from = "esp:3V3"
+to = "dht1:VCC"
+color = "red"
+
+[[connections]]
+from = "esp:GND.1"
+to = "dht1:GND"
+color = "black"
+
+[[connections]]
+from = "esp:13"
+to = "dht1:SDA"
+color = "green"
+
+[[connections]]
+from = "esp:17"
+to = "bz1:2"
+color = "green"
+
+[[connections]]
+from = "esp:GND.1"
+to = "bz1:1"
+color = "black"
+
+[[connections]]
+from = "esp:4"
+to = "btn1:1.r"
+color = "green"
+
+[[connections]]
+from = "esp:GND.1"
+to = "btn1:2.r"
+color = "black"
+
+[[connections]]
+from = "esp:16"
+to = "r1:1"
+color = "green"
+
+[[connections]]
+from = "r1:2"
+to = "led1:A"
+color = "green"
+
+[[connections]]
+from = "led1:C"
+to = "esp:GND.1"
+color = "black"

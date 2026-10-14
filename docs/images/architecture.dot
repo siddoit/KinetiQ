@@ -1,0 +1,112 @@
+digraph KINETIQ {
+  rankdir=TB;
+  bgcolor="#F8FAFC";
+  pad=0.4;
+  nodesep=0.25;
+  ranksep=0.55;
+  splines=spline;
+  compound=true;
+  fontname="Helvetica,Arial,sans-serif";
+
+  label="KINETIQ — RTOS-Based IoT Healthcare Assistant\nWearable Node → Transport → Laptop Mirror";
+  labelloc=t;
+  fontsize=19;
+  fontcolor="#0F172A";
+  fontname="Helvetica,Arial-Bold,sans-serif";
+
+  node [fontname="Helvetica,Arial,sans-serif" fontsize=10 fontcolor="#0F172A" shape=box
+        style="rounded,filled" color="#94A3B8" fillcolor=white penwidth=1.2];
+  edge [fontname="Helvetica,Arial,sans-serif" fontsize=9 fontcolor="#334155"
+        color="#475569" penwidth=1.4 arrowsize=0.9];
+
+  // ---------- TIER 1 ----------
+  subgraph cluster_tier1 {
+    label="TIER 1 — Wearable Node  (ESP32 WROOM-32 · FreeRTOS)";
+    labelloc=t; labeljust=l;
+    fontsize=12;
+    fontcolor="#1E3A5F";
+    fontname="Helvetica,Arial-Bold,sans-serif";
+    style="rounded,filled";
+    color="#3B82F6";
+    fillcolor="#DCE8F7";
+    penwidth=2;
+
+    mpu   [label="MPU6050 Motion" fillcolor="#FFFFFF"];
+    dht   [label="DHT22 Temp/Env" fillcolor="#FFFFFF"];
+    ptt   [label="PTT Button" fillcolor="#FFFFFF"];
+    extra [label="HC-SR04 · IR · Buzzer" fillcolor="#EFF6FF" fontsize=9];
+    {rank=same; mpu; dht; ptt; extra;}
+
+    sense    [label="Sensor Read" fillcolor="#BFDBFE"];
+    classify [label="Activity Classify" fillcolor="#BFDBFE"];
+    packet   [label="Telemetry Packet" fillcolor="#1D4ED8" fontcolor=white color="#1E3A5F"];
+    note     [label="Zephyr ideas reused\nArduino-ESP32 = FreeRTOS" shape=box fontsize=8
+              fillcolor="#EFF6FF" fontcolor="#334155" color="#93C5FD"];
+    {rank=same; sense; classify; packet; note;}
+
+    mpu -> sense; dht -> sense; ptt -> sense;
+    extra -> sense [style=dashed color="#64748B" label="stretch"];
+    sense -> classify -> packet;
+    packet -> note [style=invis];
+  }
+
+  // ---------- TIER 2 ----------
+  subgraph cluster_tier2 {
+    label="TIER 2 — Transport";
+    labelloc=t; labeljust=l;
+    fontsize=12;
+    fontcolor="#14532D";
+    fontname="Helvetica,Arial-Bold,sans-serif";
+    style="rounded,filled";
+    color="#22C55E";
+    fillcolor="#DDF0DC";
+    penwidth=2;
+
+    serial [label="Serial/UART · Primary" fillcolor="#16A34A" fontcolor=white color="#14532D"];
+    wifi   [label="WiFi · IoT Layer" fillcolor="#BBF7D0"];
+    ble    [label="BLE · Optional" fillcolor="#F0FDF4"];
+    {rank=same; serial; wifi; ble;}
+  }
+
+  // ---------- TIER 3 ----------
+  subgraph cluster_tier3 {
+    label="TIER 3 — Laptop Mirror  (screen = face · mic/speakers = voice)";
+    labelloc=t; labeljust=l;
+    fontsize=12;
+    fontcolor="#4A2C6A";
+    fontname="Helvetica,Arial-Bold,sans-serif";
+    style="rounded,filled";
+    color="#8B5CF6";
+    fillcolor="#E6E1F5";
+    penwidth=2;
+
+    valid [label="Schema Check\n8-Field Strict" fillcolor="#DDD6FE"];
+    dash  [label="ANSI Dashboard" fillcolor="#FFFFFF"];
+    csv   [label="CSV Session Log" fillcolor="#FFFFFF"];
+
+    stt     [label="STT" fillcolor="#FFFFFF"];
+    advisor [label="Grounded AI\nAdvisor" fillcolor="#7C3AED" fontcolor=white color="#4C1D95"];
+    check   [label="[grounding]\nCheck" shape=diamond fillcolor="#FEF08A" color="#A16207" fontsize=9];
+    tts     [label="TTS" fillcolor="#FFFFFF"];
+    {rank=same; stt; advisor; check; tts;}
+
+    valid -> dash;
+    valid -> csv;
+    stt -> advisor -> check -> tts;
+  }
+
+  safety [label="Medical-safety boundary: wellness guidance only — NOT diagnostic"
+          shape=box fontsize=10 fontcolor="#7F1D1D" fillcolor="#FEE2E2" color="#DC2626" penwidth=1.6];
+
+  // ---------- Cross-tier flow ----------
+  packet -> serial [label="1 Hz JSON"];
+  packet -> wifi [style=dashed color="#4D7C0F"];
+  packet -> ble [style=dotted color="#4D7C0F"];
+  serial -> valid [penwidth=2.2 color="#15803D"];
+  wifi -> valid [style=dashed color="#4D7C0F"];
+  ble -> valid [style=dotted color="#4D7C0F"];
+
+  ptt -> stt [style=dashed color="#7C3AED" label="PTT audio" constraint=false];
+  tts -> extra [style=dashed color="#7C3AED" label="buzzer alert" constraint=false];
+  csv -> safety [style=invis];
+}

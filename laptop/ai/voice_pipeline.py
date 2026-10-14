@@ -73,6 +73,41 @@ INSTALL_WHISPER_HINT = "install it with: pip install faster-whisper"
 INSTALL_SOUNDDEVICE_HINT = "install it with: pip install sounddevice"
 
 
+def _patch_av_open_for_faster_whisper() -> None:
+    """Drop kwargs PyAV>=15 removed that faster-whisper<=1.2.1 still passes.
+
+    faster-whisper 1.2.1 calls ``av.open(path, mode="r",
+    metadata_errors="ignore")``, but PyAV 15+ removed the ``metadata_errors``
+    (and ``metadata_encoding``) kwargs, so every transcription raised
+    ``TypeError: open() got an unexpected keyword argument
+    'metadata_errors'``. Stripping the kwargs restores default decode
+    behaviour, which is fine for clean 16 kHz WAV clips. No-op when PyAV
+    is missing or still accepts the kwargs.
+    """
+    try:
+        import av
+    except ImportError:
+        return
+    try:
+        major = int(str(getattr(av, "__version__", "0")).split(".")[0])
+    except ValueError:
+        return
+    if major < 15:
+        return
+    if getattr(av.open, "_kinetiq_compat_patched", False):
+        return
+
+    _original_open = av.open
+
+    def _open_compat(file, mode="r", *args, **kwargs):
+        kwargs.pop("metadata_errors", None)
+        kwargs.pop("metadata_encoding", None)
+        return _original_open(file, mode, *args, **kwargs)
+
+    _open_compat._kinetiq_compat_patched = True  # type: ignore[attr-defined]
+    av.open = _open_compat  # type: ignore[assignment]
+
+
 class TranscriptionUnavailableError(RuntimeError):
     """Raised when no speech-to-text backend could transcribe a clip."""
 
@@ -176,6 +211,7 @@ class AudioTranscriber:
             raise TranscriptionUnavailableError(
                 f"faster-whisper is not installed ({exc}); {INSTALL_WHISPER_HINT}"
             ) from exc
+        _patch_av_open_for_faster_whisper()
         started = time.perf_counter()
         try:
             self._model = WhisperModel(
@@ -679,6 +715,16 @@ def run_once(args: argparse.Namespace) -> int:
     result = pipeline.process_clip_sync(
         audio, query_fallback=args.query, speak=not args.no_tts
     )
+    if result.get("error", "").startswith("transcription unavailable"):
+        print(f"[stt] faster-whisper backend failed ({result['error']}); "
+              "using stub transcriber for zero-hardware demo")
+        pipeline = VoicePipeline(
+            context, advisor, tts, StubTranscriber(query=args.query),
+            verbose=args.verbose,
+        )
+        result = pipeline.process_clip_sync(
+            audio, query_fallback=args.query, speak=not args.no_tts
+        )
     return _report_single_result(result, tts, ingestor, "[summary] single-clip done")
 
 
