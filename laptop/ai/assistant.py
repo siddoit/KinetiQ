@@ -181,7 +181,13 @@ class PromptBuilder:
         "You are KINETIQ, a context-aware fitness assistant. You give brief, "
         "direct responses (1-2 sentences) grounded strictly in the user's live "
         "physiological and activity metrics. Never give medical diagnoses. If "
-        "signal quality is POOR, explicitly state that metrics are unverified."
+        "signal quality is POOR, explicitly state that metrics are unverified. "
+        "GROUNDING CONTRACT (always enforced): every reply MUST contain the "
+        "exact live activity word, the exact live exertion word, and the live "
+        "heart-rate number next to a heart word (e.g. 'heart rate is 72'). "
+        "Summary questions ('how am I doing', 'summarize', 'am i ok') MUST "
+        "also quote the live steps count with the word 'steps'. Stay under "
+        "the word limit: short answers only."
     )
 
     def build(self, payload: Dict[str, Any], user_query: str) -> List[Dict[str, str]]:
@@ -197,7 +203,14 @@ class PromptBuilder:
             "```\n\n"
             "Answer using only these metrics. These are wellness estimates from a "
             "consumer wearable, not medical measurements, and must not be framed "
-            "as a diagnosis."
+            "as a diagnosis.\n"
+            "STRICT OUTPUT CONTRACT (1-2 sentences): your reply MUST include "
+            f"(a) the exact activity word '{payload['activity']}', "
+            f"(b) the exact exertion word '{payload['exertion']}', "
+            f"(c) the phrase 'heart rate is {payload['heart_rate']}'. "
+            "For summary questions ('how am I doing', 'summarize', 'am i ok') "
+            f"also include '{payload['steps']} steps'. Copy these values "
+            "exactly -- do not paraphrase or round them."
         )
         return [
             {"role": "system", "content": self.SYSTEM_PROMPT},
@@ -215,6 +228,13 @@ class PromptBuilder:
             f"{body}\n"
             "--- END TELEMETRY ---\n\n"
             f"QUESTION: {query}\n\n"
+            "STRICT OUTPUT CONTRACT (1-2 sentences): your reply MUST include "
+            f"(a) the exact activity word '{payload['activity']}', "
+            f"(b) the exact exertion word '{payload['exertion']}', "
+            f"(c) the phrase 'heart rate is {payload['heart_rate']}'. "
+            "For summary questions ('how am I doing', 'summarize', 'am i ok') "
+            f"also include '{payload['steps']} steps'. Copy these values "
+            "exactly -- do not paraphrase or round them.\n"
             "ANSWER (1-2 sentences, metrics only, no diagnosis):"
         )
 

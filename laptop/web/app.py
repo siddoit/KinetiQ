@@ -49,6 +49,49 @@ _rejects = 0
 _start_t = time.monotonic()
 _source = "NATIVE NODE" if STDIN_MODE else "MOCK ENGINE"
 
+# ---- camera-as-sensor state (browser motion -> server hysteresis band)
+_cam = {"motion": 0.0, "ts": 0.0, "band": "rest",
+        "switch_t": time.monotonic()}
+_CAM_FRESH_S = 3.0
+_CAM_REST_MAX = 0.08
+_CAM_RUN_MIN = 0.25
+_CAM_DWELL_S = 1.5
+
+
+def _cam_fresh(now=None):
+    if STDIN_MODE:
+        return False
+    now = time.monotonic() if now is None else now
+    with _lock:
+        ts = _cam.get("ts", 0.0)
+    return (now - ts) < _CAM_FRESH_S
+
+
+def _cam_band_update(motion, now):
+    """Hysteresis band with dwell: <0.08 rest, >0.25 run, else walk."""
+    try:
+        m = float(motion)
+    except Exception:
+        m = 0.0
+    m = min(2.0, max(0.0, m))
+    with _lock:
+        band = _cam.get("band", "rest")
+        switch_t = _cam.get("switch_t", now)
+    desired = "rest" if m < _CAM_REST_MAX else ("run" if m > _CAM_RUN_MIN else "walk")
+    if desired != band and (now - switch_t) >= _CAM_DWELL_S:
+        band = desired
+        switch_t = now
+        with _lock:
+            _cam["band"] = band
+            _cam["switch_t"] = switch_t
+    return band
+
+
+def _current_source(now=None):
+    if STDIN_MODE:
+        return "NATIVE NODE"
+    return "CAMERA" if _cam_fresh(now) else "MOCK ENGINE"
+
 # ---- live assistant stack (primary path: grounded on CURRENT screen packet)
 _AI = {}
 
@@ -309,9 +352,22 @@ def _store(packet_dict):
 
 def _engine_loop():
     state = StreamerState(interval_s=1.0)
+    _orig_locate = state._locate_phase
     while True:
         t0 = time.monotonic()
         try:
+            now = time.monotonic()
+            if _cam_fresh(now):
+                with _lock:
+                    m = float(_cam.get("motion", 0.0))
+                band = _cam_band_update(m, now)
+                phase = band if band in ("rest", "walk", "run") else "rest"
+                state._locate_phase = (lambda _p=phase: (_p, 0.0))
+            else:
+                try:
+                    state._locate_phase = _orig_locate
+                except Exception:
+                    pass
             raw = build_packet(state)
             rec = TelemetryRecord.parse(raw)
             _store(rec.to_dict())
@@ -393,16 +449,29 @@ footer{padding:10px 24px;font-size:14px;color:#8b949e}
 <div style="font-size:22px;margin-top:8px">Motion <span id="mv">0.00</span></div>
 <div class="bar"><div id="mbar"></div></div></div>
 </div>
- <div class="card" id="chat"><h2 style="margin:0 0 8px">Ask the mirror</h2>
+ <div>
+ <div class="card" id="mirror"><h2 style="margin:0 0 8px">THE MIRROR SEES YOU</h2>
+ <button id="camBtn" style="font-size:19px;padding:10px 18px;border-radius:8px;background:#1f6feb;color:#fff;border:none">📷 Use camera as my sensor</button>
+ <div id="camMsg" style="font-size:15px;color:#8b949e;margin-top:8px">Mock engine driving — click to use your camera.</div>
+ <video id="camVideo" autoplay playsinline muted style="display:none;width:240px;margin-top:8px;border-radius:8px"></video>
+ <canvas id="camCanvas" width="64" height="48" style="display:none"></canvas>
+ </div>
+ <div class="card" id="chat" style="margin-top:16px"><h2 style="margin:0 0 8px">Ask the mirror</h2>
  <div id="msgs"><div class="m">🪞 I can see your live telemetry &mdash; ask me how you&rsquo;re doing.</div></div>
  <div id="qin"><input id="q" placeholder="How am I doing?"><button id="mic" title="Voice input (mic)">🎤</button><button id="spk" title="Spoken replies on/off">🔊</button><button id="send">Send</button></div>
  </div>
 </main>
-<footer>Sensors simulated (physiology engine / camera-motion / virtual IMU) &middot; answers verified against live telemetry</footer>
+<footer>Sensors simulated (physiology engine / camera-motion / virtual IMU) &middot; answers verified against live telemetry &middot; camera motion only — no video stored or uploaded</footer>
 <script>
 var hrs=[];
 function draw(){var c=document.getElementById('spark'),x=c.getContext('2d');x.clearRect(0,0,c.width,c.height);if(hrs.length<2)return;var mn=Math.min.apply(0,hrs),mx=Math.max.apply(0,hrs);if(mx-mn<5){mx+=2.5;mn-=2.5;}x.strokeStyle='#1f6feb';x.lineWidth=3;x.beginPath();for(var i=0;i<hrs.length;i++){var px=i/(59)*c.width,py=c.height-((hrs[i]-mn)/(mx-mn))*(c.height-10)-5;if(i==0)x.moveTo(px,py);else x.lineTo(px,py);}x.stroke();}
-function tick(){fetch('/api/telemetry').then(function(r){return r.json()}).then(function(d){var L=d.latest;if(!L)return;document.getElementById('src').textContent=d.source;var a=(L.activity||'--').toUpperCase(),el=document.getElementById('activity');el.textContent=a;el.className=a==='REST'?'rest':(a==='WALK'?'walk':'run');document.getElementById('hr').textContent=L.heart_rate;document.getElementById('spo2').textContent=L.spo2;document.getElementById('ex').textContent=L.exertion;document.getElementById('steps').textContent=L.steps;document.getElementById('ppg').textContent=L.ppg_quality;document.getElementById('mv').textContent=Number(L.motion_intensity).toFixed(2);document.getElementById('mbar').style.width=(L.motion_intensity*100)+'%';hrs=d.history.slice(-60);draw();});}
+function tick(){fetch('/api/telemetry').then(function(r){return r.json()}).then(function(d){var L=d.latest;if(!L)return;var s=document.getElementById('src');s.textContent=d.source;s.style.background=d.source==='CAMERA'?'#9e6a03':'#123';var a=(L.activity||'--').toUpperCase(),el=document.getElementById('activity');el.textContent=a;el.className=a==='REST'?'rest':(a==='WALK'?'walk':'run');document.getElementById('hr').textContent=L.heart_rate;document.getElementById('spo2').textContent=L.spo2;document.getElementById('ex').textContent=L.exertion;document.getElementById('steps').textContent=L.steps;document.getElementById('ppg').textContent=L.ppg_quality;document.getElementById('mv').textContent=Number(L.motion_intensity).toFixed(2);document.getElementById('mbar').style.width=(L.motion_intensity*100)+'%';hrs=d.history.slice(-60);draw();});}
+// ---- camera as sensor: getUserMedia motion -> POST /api/camera_ingest
+var camStream=null,camPrev=null,camEMA=0,camSenseTimer=null,camPostTimer=null;
+function camStop(silent){if(camSenseTimer){clearInterval(camSenseTimer);camSenseTimer=null;}if(camPostTimer){clearInterval(camPostTimer);camPostTimer=null;}if(camStream){camStream.getTracks().forEach(function(t){t.stop();});camStream=null;}camPrev=null;var v=document.getElementById('camVideo');v.removeAttribute('srcObject');v.srcObject=null;v.style.display='none';document.getElementById('camBtn').textContent='📷 Use camera as my sensor';if(!silent)document.getElementById('camMsg').textContent='Mock engine driving — click to use your camera.';}
+function camFrame(){var v=document.getElementById('camVideo');if(!v.videoWidth)return;var c=document.getElementById('camCanvas'),x=c.getContext('2d');x.drawImage(v,0,0,64,48);var d=x.getImageData(0,0,64,48).data,g=[];for(var i=0;i<d.length;i+=4){g.push((d[i]+d[i+1]+d[i+2])/3);}if(camPrev){var s=0;for(var j=0;j<g.length;j++){s+=Math.abs(g[j]-camPrev[j]);}var raw=(s/g.length)/255;camEMA=camEMA+0.25*(raw-camEMA);}camPrev=g;}
+function camPost(){fetch('/api/camera_ingest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({motion:camEMA,activity:'auto'})}).catch(function(){});}
+document.getElementById('camBtn').onclick=function(){if(camStream){camStop();return;}if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){document.getElementById('camMsg').textContent='No camera in this browser — staying on mock engine.';return;}var btn=this;navigator.mediaDevices.getUserMedia({video:true}).then(function(stream){camStream=stream;camEMA=0;camPrev=null;var v=document.getElementById('camVideo');v.srcObject=stream;v.style.display='block';btn.textContent='⏹ Stop camera';document.getElementById('camMsg').textContent='Camera live — wave to move the mirror.';camSenseTimer=setInterval(camFrame,250);camPostTimer=setInterval(camPost,1000);}).catch(function(){document.getElementById('camMsg').textContent='Camera blocked — allow camera permission, or stay on mock engine.';});};
 setInterval(function(){document.getElementById('clock').textContent=new Date().toLocaleTimeString();},1000);
 setInterval(tick,1000);tick();
 function send(){var i=document.getElementById('q');sendText(i.value.trim());i.value='';}
@@ -449,7 +518,7 @@ class Handler(BaseHTTPRequestHandler):
                 latest = dict(_latest) if _latest else None
                 hist = [p["heart_rate"] for p in _history]
                 rej = _rejects
-            body = {"latest": latest, "history": hist, "source": _source,
+            body = {"latest": latest, "history": hist, "source": _current_source(),
                     "rejects": rej, "uptime_s": int(time.monotonic() - _start_t)}
             self._send(200, json.dumps(body), "application/json")
         elif self.path.split("?")[0] in ("/", "/index.html"):
@@ -459,6 +528,38 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
+        if path == "/api/camera_ingest":
+            if STDIN_MODE:
+                self._send(409, json.dumps({"error": "stdin mode ignores camera"}),
+                           "application/json")
+                return
+            try:
+                nbytes = int(self.headers.get("Content-Length") or 0)
+            except Exception:
+                nbytes = 0
+            try:
+                raw = self.rfile.read(nbytes) if nbytes > 0 else b"{}"
+                data = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                self._send(400, json.dumps({"error": "bad JSON"}),
+                           "application/json")
+                return
+            try:
+                motion = float(data.get("motion", 0.0))
+            except Exception:
+                self._send(400, json.dumps({"error": "bad motion"}),
+                           "application/json")
+                return
+            motion = min(2.0, max(0.0, motion))
+            now = time.monotonic()
+            with _lock:
+                _cam["motion"] = motion
+                _cam["ts"] = now
+            band = _cam_band_update(motion, now)
+            self._send(200, json.dumps({"ok": True, "band": band,
+                                        "source": _current_source(now)}),
+                       "application/json")
+            return
         if path == "/api/transcribe":
             try:
                 nbytes = int(self.headers.get("Content-Length") or 0)
