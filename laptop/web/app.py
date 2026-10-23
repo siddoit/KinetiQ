@@ -224,7 +224,8 @@ def _ask_live(question, timeout_s=25.0):
     def _run():
         try:
             with _VISION_LOCK:
-                vis = dict(_MIRROR_VISION) if _MIRROR_VISION.get("timestamp", 0) > 0 else None
+                ts = _MIRROR_VISION.get("timestamp", 0)
+                vis = dict(_MIRROR_VISION) if (ts > 0 and (time.time() - ts) < 30.0) else None
             box["reply"] = advisor.advise(payload, question, visual_context=vis)
         except Exception as exc:  # noqa - LLM down -> template fallback
             box["fallback_err"] = str(exc)
@@ -253,7 +254,8 @@ def _ask_subprocess(question, timeout_s=25.0):
     py = venv_py if os.path.isfile(venv_py) else sys.executable
     cmd = [py, asst, "--query", question, "--once", "--no-tts"]
     with _VISION_LOCK:
-        if _MIRROR_VISION.get("timestamp", 0) > 0 and _MIRROR_VISION.get("descriptor"):
+        ts = _MIRROR_VISION.get("timestamp", 0)
+        if ts > 0 and (time.time() - ts) < 30.0 and _MIRROR_VISION.get("descriptor"):
             cmd.extend(["--emotion", _MIRROR_VISION["descriptor"]])
     try:
         proc = subprocess.run(
@@ -1490,12 +1492,15 @@ function postEmotionSnapshot(force) {
     fetch('/api/emotion', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image: dataUrl })
+      body: JSON.stringify({ image: dataUrl, person: personInFrame })
     }).then(function (r) { return r.json(); }).then(function (d) {
       emoBusy = false;
-      if (d && d.vision && d.vision.label) {
-        var eb = $('emoBadge');
-        if (eb) {
+      var eb = $('emoBadge');
+      if (eb) {
+        if (!personInFrame) {
+          eb.className = 'pres-badge idle';
+          eb.innerHTML = '<span class="dot"></span>Mood: --';
+        } else if (d && d.vision && d.vision.label) {
           eb.style.display = 'inline-flex';
           var raw = d.vision.raw_emotion;
           var cls = (raw === 'Anger' || raw === 'Fear' || raw === 'Sadness') ? 'detecting' : 'active';
@@ -1783,9 +1788,21 @@ class Handler(BaseHTTPRequestHandler):
                 nbytes = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(nbytes) if nbytes > 0 else b"{}"
                 data = json.loads(raw.decode("utf-8") or "{}")
-                img_data = str(data.get("image", "") or "")
-                det = _get_emotion_detector()
-                res = det.detect_from_base64(img_data)
+                has_person = data.get("person", True)
+                if not has_person:
+                    res = {
+                        "raw_emotion": "Neutral",
+                        "descriptor": "calm and balanced",
+                        "label": "Calm",
+                        "tone": "balanced",
+                        "confidence": 1.0,
+                        "face_detected": False,
+                        "timestamp": 0.0,
+                    }
+                else:
+                    img_data = str(data.get("image", "") or "")
+                    det = _get_emotion_detector()
+                    res = det.detect_from_base64(img_data)
                 with _VISION_LOCK:
                     _MIRROR_VISION.update(res)
                 self._send(200, json.dumps({"status": "ok", "vision": res}), "application/json")

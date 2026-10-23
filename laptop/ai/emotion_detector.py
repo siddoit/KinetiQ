@@ -145,18 +145,29 @@ class EmotionDetector:
                 face_roi = None
 
         # 2. Fallback: Center crop (mirror user is in center of frame)
-        if face_roi is None or face_roi.size == 0:
-            cy1 = int(h * 0.15)
-            cy2 = int(h * 0.85)
-            cx1 = int(w * 0.20)
-            cx2 = int(w * 0.80)
-            face_roi = frame[cy1:cy2, cx1:cx2]
+        if face_roi is None or face_roi.size == 0 or face_roi.shape[0] < 12 or face_roi.shape[1] < 12:
+            cy1 = max(0, int(h * 0.15))
+            cy2 = min(h, int(h * 0.85))
+            cx1 = max(0, int(w * 0.20))
+            cx2 = min(w, int(w * 0.80))
+            if cy2 > cy1 and cx2 > cx1:
+                face_roi = frame[cy1:cy2, cx1:cx2]
+            else:
+                face_roi = frame
 
-        # 3. ONNX HSEmotion prediction
+        if face_roi is None or face_roi.size == 0:
+            return dict(self._last_result)
+
+        # 3. ONNX HSEmotion prediction (EfficientNet expects RGB format)
         try:
+            try:
+                face_rgb = cv2.cvtColor(face_roi, cv2.COLOR_BGR2RGB)
+            except Exception:
+                face_rgb = face_roi
+
             with self._lock:
                 raw_emo, scores = self._model.predict_emotions(
-                    face_roi, logits=False
+                    face_rgb, logits=False
                 )
                 conf = float(np.max(scores)) if scores is not None else 0.90
 
