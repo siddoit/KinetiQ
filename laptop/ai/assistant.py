@@ -249,7 +249,12 @@ class PromptBuilder:
         "Do not use any emojis or emoticons in your responses; use plain text only."
     )
 
-    def _format_instruction(self, payload: Dict[str, Any], query: str) -> str:
+    def _format_instruction(
+        self,
+        payload: Dict[str, Any],
+        query: str,
+        visual_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
         q_lower = query.lower()
         is_summary = any(
             w in q_lower
@@ -270,28 +275,49 @@ class PromptBuilder:
             if payload.get("ppg_quality") == "poor"
             else ""
         )
+        visual_note = ""
+        if visual_context and isinstance(visual_context, dict):
+            desc = visual_context.get("descriptor") or visual_context.get("label")
+            tone = visual_context.get("tone")
+            if desc:
+                visual_note = (
+                    f" Mirror vision observes user appears {desc}."
+                    f" Reflect this empathetically in your tone and advice."
+                )
+
         if is_summary or not query:
             return (
-                f"Directly summarize the user's current wellness state. Mention their current activity ('{payload['activity']}'), "
+                f"Directly summarize the user's current wellness state.{visual_note} "
+                f"Mention their current activity ('{payload['activity']}'), "
                 f"exertion ('{payload['exertion']}'), heart rate ('{payload['heart_rate']} BPM'), and steps ('{payload['steps']} steps'), "
                 f"followed by an encouraging wellness tip. Do not use emojis.{poor_note}"
             )
         return (
-            f"First and foremost, directly and thoughtfully answer what the user asked: \"{query}\". "
+            f"First and foremost, directly and thoughtfully answer what the user asked: \"{query}\".{visual_note} "
             f"Then connect your explanation to their live physiological context (current heart rate '{payload['heart_rate']} BPM', "
             f"'{payload['activity']}' at '{payload['exertion']}' exertion, and '{payload['steps']} steps') where relevant. "
             f"Provide insightful health guidance rather than generic canned stretching advice. Do not use emojis.{poor_note}"
         )
 
-    def build(self, payload: Dict[str, Any], user_query: str) -> List[Dict[str, str]]:
+    def build(
+        self,
+        payload: Dict[str, Any],
+        user_query: str,
+        visual_context: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, str]]:
         """Build an OpenAI-style chat message list."""
         _validate_payload(payload)
         query = (user_query or "").strip()
         body = json.dumps(payload, indent=2)
-        instruction = self._format_instruction(payload, query)
+        instruction = self._format_instruction(payload, query, visual_context=visual_context)
+        vis_line = ""
+        if visual_context and isinstance(visual_context, dict):
+            v_desc = visual_context.get("descriptor") or visual_context.get("label")
+            if v_desc:
+                vis_line = f"\nObserved Facial Expression / State: {v_desc}\n"
         content = (
             f"User: {query}\n\n"
-            f"Live Telemetry Context:\n{body}\n\n"
+            f"Live Telemetry Context:\n{body}\n{vis_line}\n"
             f"{instruction}\nKeep it natural and under 85 words. Do not give medical diagnoses."
         )
         return [
@@ -299,17 +325,27 @@ class PromptBuilder:
             {"role": "user", "content": content},
         ]
 
-    def build_generate_prompt(self, payload: Dict[str, Any], user_query: str) -> str:
+    def build_generate_prompt(
+        self,
+        payload: Dict[str, Any],
+        user_query: str,
+        visual_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Build one flat prompt string for Ollama's /api/generate endpoint."""
         _validate_payload(payload)
         query = (user_query or "").strip()
         body = json.dumps(payload, indent=2)
-        instruction = self._format_instruction(payload, query)
+        instruction = self._format_instruction(payload, query, visual_context=visual_context)
+        vis_line = ""
+        if visual_context and isinstance(visual_context, dict):
+            v_desc = visual_context.get("descriptor") or visual_context.get("label")
+            if v_desc:
+                vis_line = f"\nObserved Facial Expression / State: {v_desc}\n"
         return (
             f"<start_of_turn>user\n"
             f"{self.SYSTEM_PROMPT}\n\n"
             f"User: {query}\n\n"
-            f"Live Telemetry Context:\n{body}\n\n"
+            f"Live Telemetry Context:\n{body}\n{vis_line}\n"
             f"{instruction}<end_of_turn>\n"
             f"<start_of_turn>model\n"
         )
@@ -334,11 +370,20 @@ class AIAdvisor:
         self.last_error: str = ""
         self.last_backend: str = ""
 
-    def advise(self, payload: Dict[str, Any], user_query: str) -> str:
+    def advise(
+        self,
+        payload: Dict[str, Any],
+        user_query: str,
+        visual_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Return a grounded reply, or raise AIUnavailableError."""
         builder = PromptBuilder()
-        prompt = builder.build_generate_prompt(payload, user_query)
-        messages = builder.build(payload, user_query)
+        prompt = builder.build_generate_prompt(
+            payload, user_query, visual_context=visual_context
+        )
+        messages = builder.build(
+            payload, user_query, visual_context=visual_context
+        )
 
         self.last_error = ""
         errors: List[str] = []
@@ -709,6 +754,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TIMEOUT_S,
         help=f"LLM request timeout in seconds (default {DEFAULT_TIMEOUT_S:g})",
     )
+    parser.add_argument(
+        "--emotion",
+        default=None,
+        help="ambient visual emotion context (e.g. 'fatigued', 'tense', 'happy', 'calm')",
+    )
     return parser
 
 
@@ -799,8 +849,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 break
 
             print(f"[payload] {json.dumps(payload)}")
+            vis_ctx = (
+                {"descriptor": args.emotion, "label": args.emotion.capitalize()}
+                if args.emotion
+                else None
+            )
             try:
-                reply = advisor.advise(payload, query)
+                reply = advisor.advise(payload, query, visual_context=vis_ctx)
                 print(f"[llm] reply via {advisor.last_backend}: {reply}")
             except AIUnavailableError as exc:
                 print(

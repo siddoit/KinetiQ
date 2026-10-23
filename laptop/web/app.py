@@ -223,7 +223,9 @@ def _ask_live(question, timeout_s=25.0):
 
     def _run():
         try:
-            box["reply"] = advisor.advise(payload, question)
+            with _VISION_LOCK:
+                vis = dict(_MIRROR_VISION) if _MIRROR_VISION.get("timestamp", 0) > 0 else None
+            box["reply"] = advisor.advise(payload, question, visual_context=vis)
         except Exception as exc:  # noqa - LLM down -> template fallback
             box["fallback_err"] = str(exc)
             try:
@@ -249,9 +251,13 @@ def _ask_subprocess(question, timeout_s=25.0):
     venv_py = os.path.join(root, "laptop", ".venv", "Scripts", "python.exe")
     asst = os.path.join(_AI_DIR, "assistant.py")
     py = venv_py if os.path.isfile(venv_py) else sys.executable
+    cmd = [py, asst, "--query", question, "--once", "--no-tts"]
+    with _VISION_LOCK:
+        if _MIRROR_VISION.get("timestamp", 0) > 0 and _MIRROR_VISION.get("descriptor"):
+            cmd.extend(["--emotion", _MIRROR_VISION["descriptor"]])
     try:
         proc = subprocess.run(
-            [py, asst, "--query", question, "--once", "--no-tts"],
+            cmd,
             capture_output=True, text=True, timeout=timeout_s,
         )
     except subprocess.TimeoutExpired:
@@ -481,6 +487,33 @@ def synthesize_neural_tts(text: str, voice: str = "en-US-JennyNeural") -> Option
         return asyncio.run(_produce())
     except Exception:
         return None
+
+
+# ---- ambient vision context: emotion and facial expression
+_VISION_LOCK = threading.Lock()
+_VISION_DETECTOR = {"detector": None}
+_MIRROR_VISION = {
+    "raw_emotion": "Neutral",
+    "descriptor": "calm and balanced",
+    "label": "Calm / Balanced",
+    "tone": "balanced",
+    "confidence": 1.0,
+    "face_detected": False,
+    "timestamp": 0.0,
+}
+
+
+def _get_emotion_detector():
+    with _VISION_LOCK:
+        if _VISION_DETECTOR["detector"] is not None:
+            return _VISION_DETECTOR["detector"]
+        try:
+            from emotion_detector import EmotionDetector
+        except ImportError:
+            from laptop.ai.emotion_detector import EmotionDetector
+        det = EmotionDetector.get_instance()
+        _VISION_DETECTOR["detector"] = det
+        return det
 
 
 # ---- freshness derivation: exactly four states, never guessed
@@ -1094,7 +1127,13 @@ footer{
 </section>
 <section class="col right">
 <div class="zone mirror" id="mirror">
-<div class="head"><span class="eyebrow">The mirror sees you</span><span id="presBadge" class="pres-badge idle"><span class="dot"></span>No person detected</span></div>
+<div class="head">
+  <span class="eyebrow">The mirror sees you</span>
+  <span style="display:inline-flex;gap:6px;align-items:center">
+    <span id="presBadge" class="pres-badge idle"><span class="dot"></span>No person detected</span>
+    <span id="emoBadge" class="pres-badge idle" style="display:none"><span class="dot"></span>Mood: --</span>
+  </span>
+</div>
 <div class="mirror-row">
 <button id="camBtn" class="btn primary">Activate Camera Mirror</button>
 <video id="camVideo" autoplay playsinline muted style="display:none"></video>
@@ -1417,7 +1456,7 @@ function checkPresenceAndGreet() {
         var m = $('msgs');
         m.innerHTML += '<div class="m system">User detected for 5s &mdash; Spoken greeting activated!</div>';
         m.scrollTop = m.scrollHeight;
-        sendText("Hello mirror, I just stepped in front of you. Greet me, tell me my live stats, and give me a quick health suggestion.", true);
+        sendText("Hello mirror, I just stepped in front of you. Greet me, note my live stats and how I look, and give me a quick health suggestion.", true);
       }
     }
   } else {
@@ -1431,6 +1470,41 @@ function checkPresenceAndGreet() {
       }
     }
   }
+}
+
+var lastEmoPost = 0, emoBusy = false;
+function postEmotionSnapshot(force) {
+  var now = Date.now();
+  if (!camStream || emoBusy || (!force && (now - lastEmoPost < 3500))) { return; }
+  var v = $('camVideo');
+  if (!v || !v.videoWidth) { return; }
+  lastEmoPost = now;
+  emoBusy = true;
+  try {
+    var c = document.createElement('canvas');
+    c.width = 320;
+    c.height = 240;
+    var ctx = c.getContext('2d');
+    ctx.drawImage(v, 0, 0, 320, 240);
+    var dataUrl = c.toDataURL('image/jpeg', 0.6);
+    fetch('/api/emotion', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image: dataUrl })
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      emoBusy = false;
+      if (d && d.vision && d.vision.label) {
+        var eb = $('emoBadge');
+        if (eb) {
+          eb.style.display = 'inline-flex';
+          var raw = d.vision.raw_emotion;
+          var cls = (raw === 'Anger' || raw === 'Fear' || raw === 'Sadness') ? 'detecting' : 'active';
+          eb.className = 'pres-badge ' + cls;
+          eb.innerHTML = '<span class="dot"></span>Mood: ' + d.vision.label;
+        }
+      }
+    }).catch(function () { emoBusy = false; });
+  } catch (e) { emoBusy = false; }
 }
 
 function camStop(silent) {
@@ -1447,6 +1521,8 @@ function camStop(silent) {
   v.style.display = 'none';
   $('camBtn').textContent = 'Activate Camera Mirror';
   updatePresenceUI('idle', '<span class="dot"></span>No person detected', 'Click above to activate camera mirror.');
+  var eb = $('emoBadge');
+  if (eb) { eb.style.display = 'none'; eb.className = 'pres-badge idle'; eb.innerHTML = '<span class="dot"></span>Mood: --'; }
 }
 
 function camFrame() {
@@ -1499,6 +1575,7 @@ function camPost() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ motion: camEMA, activity: 'auto' })
   }).catch(function () {});
+  postEmotionSnapshot(false);
   checkPresenceAndGreet();
 }
 
@@ -1519,6 +1596,8 @@ $('camBtn').onclick = function () {
     v.style.display = 'block';
     btn.textContent = 'Stop Camera';
     updatePresenceUI('idle', '<span class="dot"></span>Scanning...', 'Camera live — stand in front of mirror.');
+    var eb = $('emoBadge');
+    if (eb) { eb.style.display = 'inline-flex'; eb.className = 'pres-badge idle'; eb.innerHTML = '<span class="dot"></span>Mood: Scanning...'; }
     camSenseTimer = setInterval(camFrame, 250);
     camPostTimer = setInterval(camPost, 1000);
   }).catch(function () {
@@ -1534,6 +1613,7 @@ function send() { var i = $('q'); sendText(i.value.trim()); i.value = ''; }
 function sendText(q, isAuto) {
   if (!q) { return; }
   stopSpeech();
+  postEmotionSnapshot(true);
   var m = $('msgs');
   if (!isAuto) {
     m.innerHTML += '<div class="m user"><span class="m-tag">YOU</span><span class="m-body">' + q.replace(/</g, '&lt;') + '</span></div>';
@@ -1688,6 +1768,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, audio_data, "audio/mpeg")
             else:
                 self._send(503, '{"error":"neural tts unavailable"}', "application/json")
+        elif self.path.split("?")[0] == "/api/emotion":
+            with _VISION_LOCK:
+                self._send(200, json.dumps(_MIRROR_VISION), "application/json")
         elif self.path.split("?")[0] in ("/", "/index.html"):
             self._send(200, PAGE, "text/html; charset=utf-8")
         else:
@@ -1695,6 +1778,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
+        if path == "/api/emotion":
+            try:
+                nbytes = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(nbytes) if nbytes > 0 else b"{}"
+                data = json.loads(raw.decode("utf-8") or "{}")
+                img_data = str(data.get("image", "") or "")
+                det = _get_emotion_detector()
+                res = det.detect_from_base64(img_data)
+                with _VISION_LOCK:
+                    _MIRROR_VISION.update(res)
+                self._send(200, json.dumps({"status": "ok", "vision": res}), "application/json")
+            except Exception as exc:
+                self._send(500, json.dumps({"error": str(exc)}), "application/json")
+            return
         if path == "/api/mode":
             global _ACTIVE_MODE
             if STDIN_MODE:
