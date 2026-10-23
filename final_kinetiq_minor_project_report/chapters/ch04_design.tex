@@ -33,7 +33,7 @@ KINETIQ has a sensing/control tier, a local transport and validation tier, and a
 \node[common,right=of bridge] (schema) {Eight-field schema\\source + freshness};
 \node[common,right=of schema] (mirror) {Wellness mirror\\dashboard + assistant};
 \draw[flow] (post.south) |- (bridge.north);
-\draw[flow] (rtosjson.south) |- node[pos=.18,right,font=\scriptsize,align=left]{synthetic\\label retained} (bridge.north);
+\draw[flow] (rtosjson.south) |- node[pos=.18,right,xshift=1.5mm,yshift=-3mm,font=\scriptsize,align=left]{synthetic\\label retained} (bridge.north);
 \draw[flow] (bridge)--(schema);
 \draw[flow] (schema)--(mirror);
 \end{tikzpicture}
@@ -105,7 +105,7 @@ Figure~\ref{fig:validation-flow} depicts the shared decision flow. Syntax alone 
 \section{Dashboard and Assistance Layer}
 The laptop dashboard runs a threaded HTTP server on loopback, tries port 8777 and then 8778 when necessary, and ingests valid JSON through standard input or application endpoints. It maintains a snapshot plus arrival and value-change times. The cards show accepted wellness context along with the source and data state. Browser-camera handling is limited to a pixel-difference motion proxy; no implemented pose or posture classifier is claimed.
 
-\begin{figure}[H]
+\begin{figure}[htbp]
 \centering
 \includegraphics[width=\textwidth]{ui_live.png}
 \caption[Dashboard mirror with synthetic stream (not live)]{Implemented dashboard mirror rendered in the browser during a controlled local input session; the displayed stream is synthetic, not live wearable telemetry.}
@@ -121,7 +121,7 @@ The verifier checks specified agreement with activity, exertion, an exact HR/hea
 \section{Hardware Design Scope}
 The selected embedded components are an ESP32 DevKit V1, MPU6050, HC-SR04, infrared sensor, DHT22, and supporting wiring/prototyping materials. The materials include pin mapping and a Wokwi sketch. Figure~\ref{fig:hardware-concept} reproduces the project material's earlier hardware-path diagram as a conceptual design reference. It is not used as evidence of final physical sensor acquisition.
 
-\begin{figure}[H]
+\begin{figure}[htbp]
 \centering
 \includegraphics[width=0.82\textwidth]{existing_architecture.png}
 \caption[Earlier hardware-path conceptual architecture]{Earlier hardware-path conceptual architecture from the KINETIQ project materials. The physical ESP32 sensing path remained planned/simulated at the documented final demonstration.}

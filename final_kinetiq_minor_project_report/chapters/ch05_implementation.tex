@@ -61,6 +61,7 @@ The Android relay converts relevant Huawei Health interface observations into a 
 
 The following pseudocode captures the bridge decision without exposing application secrets or unrelated implementation detail:
 
+\needspace{80mm}
 \begin{lstlisting}[caption={Genuine-only bridge policy, simplified.},label={lst:bridge-policy}]
 snapshot = read_latest_authenticated_relay_snapshot()
 if snapshot.simulated or snapshot.freshness != "live": reject()

@@ -199,6 +199,20 @@ def _ask_live(question, timeout_s=25.0):
     with _lock:
         pkt = dict(_latest) if _latest else None
     if pkt is None:
+        t_deadline = time.monotonic() + 1.2
+        while time.monotonic() < t_deadline:
+            time.sleep(0.08)
+            with _lock:
+                if _latest:
+                    pkt = dict(_latest)
+                    break
+    if pkt is None and build_packet is not None:
+        try:
+            st = StreamerState(interval_s=1.0) if StreamerState else None
+            pkt = build_packet(st) if st else None
+        except Exception:
+            pkt = None
+    if pkt is None:
         return ("No telemetry yet -- wait a second and ask again.", "FAIL")
     payload = _payload7(pkt)
     advisor_cls = _AI["advisor_cls"]
@@ -1292,10 +1306,28 @@ function updateModeUI(m, locked) {
 }
 
 /* ---- natural female speech synthesis (Jenny / Aria / Zira) ---- */
+var currentAudio = null;
+
+function stopSpeech() {
+  if (currentAudio) {
+    try {
+      currentAudio.pause();
+      currentAudio.currentTime = 0;
+      currentAudio.src = '';
+    } catch (e) {}
+    currentAudio = null;
+  }
+  if (window.speechSynthesis) {
+    try {
+      window.speechSynthesis.cancel();
+    } catch (e) {}
+  }
+}
+
 function speakNaturalFemale(text) {
+  stopSpeech();
   if (!window.speechSynthesis || !ttsOn) return;
   try {
-    window.speechSynthesis.cancel();
     var clean = text.replace(/[*_#`~]/g, '').trim();
     var u = new SpeechSynthesisUtterance(clean);
     var voices = window.speechSynthesis.getVoices();
@@ -1313,13 +1345,24 @@ function speakNaturalFemale(text) {
     console.error('Speech synthesis error:', e);
   }
 }
+
 function speakAudio(text) {
+  stopSpeech();
   if (!ttsOn || !text) return;
   var clean = text.replace(/[*_#`~]/g, '').trim();
   if (!clean) return;
   try {
-    var audio = new Audio('/api/tts?text=' + encodeURIComponent(clean));
-    audio.play().catch(function (e) {
+    var a = new Audio('/api/tts?text=' + encodeURIComponent(clean));
+    currentAudio = a;
+    a.onended = function () {
+      if (currentAudio === a) currentAudio = null;
+    };
+    a.onerror = function () {
+      if (currentAudio === a) currentAudio = null;
+      speakNaturalFemale(clean);
+    };
+    a.play().catch(function (e) {
+      if (currentAudio === a) currentAudio = null;
       speakNaturalFemale(clean);
     });
   } catch (e) {
@@ -1490,6 +1533,7 @@ var ttsOn = true, recorder = null, chunks = [], recTimer = null, chatOpen = true
 function send() { var i = $('q'); sendText(i.value.trim()); i.value = ''; }
 function sendText(q, isAuto) {
   if (!q) { return; }
+  stopSpeech();
   var m = $('msgs');
   if (!isAuto) {
     m.innerHTML += '<div class="m user"><span class="m-tag">YOU</span><span class="m-body">' + q.replace(/</g, '&lt;') + '</span></div>';
@@ -1531,6 +1575,7 @@ function setChat(open) {
 $('chatToggle').onclick = function () { setChat(!chatOpen); };
 $('spk').onclick = function () {
   ttsOn = !ttsOn;
+  if (!ttsOn) { stopSpeech(); }
   this.textContent = ttsOn ? 'Voice On' : 'Voice Muted';
   this.classList.toggle('primary', ttsOn);
 };
@@ -1547,6 +1592,7 @@ function stopMic() {
   b.textContent = 'Mic';
 }
 $('mic').onclick = function () {
+  stopSpeech();
   if (recorder && recorder.state !== 'inactive') { stopMic(); return; }
   if (!window.MediaRecorder || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     micHint('no microphone in this browser');
@@ -1554,6 +1600,7 @@ $('mic').onclick = function () {
   }
   var btn = this;
   navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+    stopSpeech();
     chunks = [];
     try { recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' }); }
     catch (e) { recorder = new MediaRecorder(stream); }

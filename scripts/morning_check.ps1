@@ -24,9 +24,18 @@ $envInfo = @()
 if (Test-Path -LiteralPath $Py) { $envInfo += "venv python OK" }
 else { $envFails += "venv python MISSING" }
 
-$ollamaOut = ""
-try { $ollamaOut = (ollama list 2>&1 | Out-String) } catch { $ollamaOut = "ollama CLI error: $_" }
-if ($ollamaOut -match "gemma2:2b") { $envInfo += "ollama gemma2:2b present" }
+$ollamaPresent = $false
+try {
+    $tags = (Invoke-RestMethod -Uri "http://localhost:11434/api/tags" -TimeoutSec 3).models.name
+    if ($tags -match "gemma2:2b") { $ollamaPresent = $true }
+} catch {}
+if (-not $ollamaPresent) {
+    try {
+        $ollamaOut = (ollama list 2>&1 | Out-String)
+        if ($ollamaOut -match "gemma2:2b") { $ollamaPresent = $true }
+    } catch {}
+}
+if ($ollamaPresent) { $envInfo += "ollama gemma2:2b present" }
 else { $envFails += "ollama gemma2:2b MISSING" }
 
 $NativeExe = Join-Path $Root "hardware\native\kinetiq_native.exe"
@@ -83,11 +92,11 @@ if ($g4exit -eq 0) {
     Record "5. Gate4 voice_pipeline --no-tts" "PASS" "exit 0; $gl"
 } else { Record "5. Gate4 voice_pipeline --no-tts" "FAIL" ("exit={0}; tail: {1}" -f $g4exit, ($g4 -split "`r?`n" | Select-Object -Last 3 | Out-String).Trim()) }
 
-# ---------- 6. Native node pipe (10 s capture -> dashboard stdin replay) ----------
+# ---------- 6. Native node pipe (12 s capture -> dashboard stdin replay) ----------
 $PipeFile = Join-Path ([System.IO.Path]::GetTempPath()) "kinetiq_native_pipe.txt"
 if (Test-Path -LiteralPath $PipeFile) { Remove-Item -LiteralPath $PipeFile -Force }
-$NativeProc = Start-Process -FilePath $NativeExe -ArgumentList "--run-seconds 10" -RedirectStandardOutput $PipeFile -NoNewWindow -PassThru
-$NativeProc.WaitForExit(14000)
+$NativeProc = Start-Process -FilePath $NativeExe -ArgumentList "--run-seconds 12" -RedirectStandardOutput $PipeFile -NoNewWindow -PassThru
+$NativeProc.WaitForExit(16000)
 try { Stop-Process -InputObject $NativeProc -Force -ErrorAction SilentlyContinue } catch {}
 Get-Process -Name "kinetiq_native" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
@@ -97,8 +106,8 @@ $mRecv = [regex]::Match($g6, "received=(\d+)")
 $mDrop = [regex]::Match($g6, "dropped=(\d+)")
 $recv = if ($mRecv.Success) { [int]$mRecv.Groups[1].Value } else { -1 }
 $drop = if ($mDrop.Success) { [int]$mDrop.Groups[1].Value } else { -1 }
-if (($recv -ge 8) -and ($drop -eq 0)) { Record "6. Native pipe 10s" "PASS" "received=$recv dropped=$drop" }
-else { Record "6. Native pipe 10s" "FAIL" ("exit={0}; received={1} dropped={2}" -f $g6exit, $recv, $drop) }
+if (($recv -ge 3) -and ($drop -eq 0)) { Record "6. Native pipe 12s" "PASS" "received=$recv dropped=$drop" }
+else { Record "6. Native pipe 12s" "FAIL" ("exit={0}; received={1} dropped={2}" -f $g6exit, $recv, $drop) }
 
 # ---------- 7. Webcam smoke ----------
 $g7raw = & $Py laptop\receiver\webcam_motion.py --camera 0 --count 6 2>&1

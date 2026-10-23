@@ -56,6 +56,41 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
+
+def _patch_windows_socketpair():
+    """Windows Hyper-V/NAT dynamic port collisions can break socketpair(host, 0)."""
+    import socket
+
+    if getattr(socket, "_kinetiq_patched", False):
+        return
+    orig = getattr(socket, "socketpair", None)
+
+    def _safe_socketpair(family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0):
+        for port in range(49200, 49950):
+            lsock = socket.socket(family, type, proto)
+            try:
+                lsock.bind(("127.0.0.1", port))
+                lsock.listen(1)
+                csock = socket.socket(family, type, proto)
+                csock.connect(("127.0.0.1", port))
+                ssock, _ = lsock.accept()
+                lsock.close()
+                return (ssock, csock)
+            except Exception:
+                try:
+                    lsock.close()
+                except Exception:
+                    pass
+                continue
+        if orig:
+            return orig(family, type, proto)
+
+    socket.socketpair = _safe_socketpair
+    socket._kinetiq_patched = True
+
+
+_patch_windows_socketpair()
+
 # The telemetry contract lives in laptop/receiver; make it importable no matter
 # which directory this file was launched from (Windows-safe, no POSIX tricks).
 _LAPTOP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -271,8 +306,8 @@ class PromptBuilder:
         body = json.dumps(payload, indent=2)
         instruction = self._format_instruction(payload, query)
         return (
-            f"<start_of_turn>system\n{self.SYSTEM_PROMPT}<end_of_turn>\n"
             f"<start_of_turn>user\n"
+            f"{self.SYSTEM_PROMPT}\n\n"
             f"User: {query}\n\n"
             f"Live Telemetry Context:\n{body}\n\n"
             f"{instruction}<end_of_turn>\n"
@@ -353,8 +388,18 @@ class AIAdvisor:
         try:
             resp = requests.post(
                 self.ollama_url,
-                json={"model": self.model, "prompt": prompt, "stream": False,
-                      "options": {"temperature": 0.7, "num_predict": 220}},
+                json={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.5,
+                        "num_predict": 85,
+                        "top_p": 0.85,
+                        "top_k": 40,
+                    },
+                    "stop": ["<end_of_turn>", "\n\nUser:", "User:"],
+                },
                 timeout=self.timeout,
             )
             resp.raise_for_status()
