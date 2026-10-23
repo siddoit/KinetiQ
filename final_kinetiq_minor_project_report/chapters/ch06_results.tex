@@ -52,6 +52,36 @@ The recorded dashboard session \code{session\_20261014\_193826.csv} contains 75 
 
 \begin{figure}[H]
 \centering
+\begin{subfigure}[t]{0.48\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{ui_live.png}
+  \caption{Live}
+  \label{fig:dashboard-states-live}
+\end{subfigure}\hfill
+\begin{subfigure}[t]{0.48\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{ui_unchanged.png}
+  \caption{Unchanged}
+  \label{fig:dashboard-states-unchanged}
+\end{subfigure}\\[3pt]
+\begin{subfigure}[t]{0.48\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{ui_stale.png}
+  \caption{Stale}
+  \label{fig:dashboard-states-stale}
+\end{subfigure}\hfill
+\begin{subfigure}[t]{0.48\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{ui_offline.png}
+  \caption{Offline}
+  \label{fig:dashboard-states-offline}
+\end{subfigure}
+\caption{Dashboard freshness states observed under controlled synthetic input: live, unchanged, stale and offline. These captures exercise the freshness/offline logic; they are not live wearable telemetry.}
+\label{fig:dashboard-states}
+\end{figure}
+
+\begin{figure}[H]
+\centering
 \includegraphics[width=\textwidth]{mock_telemetry_results.png}
 \caption{Mock telemetry session: synthetic sensor stream (30 samples at approximately 1 Hz) from the project materials. It is not a genuine biometric time series.}
 \label{fig:mock-telemetry}

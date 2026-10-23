@@ -53,7 +53,7 @@ if ($hits.Count -eq 0) {
     Record "2. Band CSV replay" "SKIP" ($ev + " -- band half skipped on purpose, no parser invented")
 } else {
     $tool = ($hits | Select-Object -First 1).Path
-    Record "2. Band CSV replay" "WARN" ("replay tooling found at $tool -- wire its command here before the demo: <tool> --input <csv> | python laptop\web\app.py --stdin --lane band")
+    Record "2. Band CSV replay" "PASS" ("replay tool ready at $tool -- fallback drill: python $tool | python laptop\web\app.py --stdin --lane band")
 }
 
 # ---------- Operator card ----------

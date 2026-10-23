@@ -585,8 +585,10 @@ def _band_collector_loop():
                     if TelemetryRecord:
                         rec = TelemetryRecord.parse(pkt)
                         _store(rec.to_dict())
-        except Exception:
-            pass
+        except urllib.error.URLError:
+            pass  # quiet polling when receiver is offline
+        except Exception as exc:
+            print("[band-collector] error: %s" % exc, file=sys.stderr, flush=True)
         time.sleep(1.0)
 
 
@@ -634,9 +636,11 @@ def _stdin_loop():
         try:
             rec = TelemetryRecord.parse(s)
             _store(rec.to_dict())
-        except Exception:  # noqa - bad frame counted, never rendered
+        except Exception as exc:  # noqa - bad frame counted, never rendered
             with _lock:
                 _rejects += 1
+            print("[stdin] reject frame: %s" % exc, file=sys.stderr, flush=True)
+    print("[stdin] pipe closed (EOF received)", file=sys.stderr, flush=True)
 
 
 PAGE = """
@@ -1161,7 +1165,7 @@ function tick() {
     $('mbar').style.width = (Number(L.motion_intensity) * 100) + '%';
     hrs = d.history.slice(-60);
     draw();
-    if (d.mode) { updateModeUI(d.mode); }
+    if (d.mode) { updateModeUI(d.mode, d.locked); }
   });
 }
 
@@ -1171,14 +1175,34 @@ function setMode(m) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ mode: m })
   }).then(function (r) { return r.json(); }).then(function (d) {
-    updateModeUI(d.mode);
+    if (d.error) { alert(d.error); }
+    updateModeUI(d.mode, d.locked);
   }).catch(function () {});
 }
-function updateModeUI(m) {
+function updateModeUI(m, locked) {
   var bb = $('btnModeBand'), br = $('btnModeRtos');
   if (bb && br) {
     bb.classList.toggle('active', m === 'band');
     br.classList.toggle('active', m === 'rtos');
+    if (locked) {
+      bb.disabled = true;
+      br.disabled = true;
+      bb.style.cursor = 'not-allowed';
+      br.style.cursor = 'not-allowed';
+      bb.style.opacity = (m === 'band' ? '1.0' : '0.4');
+      br.style.opacity = (m === 'rtos' ? '1.0' : '0.4');
+      bb.title = 'Locked: live telemetry piped from stdin';
+      br.title = 'Locked: live telemetry piped from stdin';
+    } else {
+      bb.disabled = false;
+      br.disabled = false;
+      bb.style.cursor = 'pointer';
+      br.style.cursor = 'pointer';
+      bb.style.opacity = '';
+      br.style.opacity = '';
+      bb.title = 'Switch to Huawei Band 6 mode';
+      br.title = 'Switch to FreeRTOS control mode';
+    }
   }
 }
 
@@ -1400,10 +1424,11 @@ class Handler(BaseHTTPRequestHandler):
             body = {"latest": latest, "history": hist, "source": _current_source(),
                     "rejects": rej, "uptime_s": int(time.monotonic() - _start_t),
                     "freshness": _freshness(), "link": _link(),
-                    "lane": _current_lane_label(), "mode": _ACTIVE_MODE}
+                    "lane": _current_lane_label(), "mode": _ACTIVE_MODE,
+                    "locked": STDIN_MODE}
             self._send(200, json.dumps(body), "application/json")
         elif self.path.split("?")[0] == "/api/mode":
-            self._send(200, json.dumps({"mode": _ACTIVE_MODE, "lane": _current_lane_label()}), "application/json")
+            self._send(200, json.dumps({"mode": _ACTIVE_MODE, "lane": _current_lane_label(), "locked": STDIN_MODE}), "application/json")
         elif self.path.split("?")[0] in ("/", "/index.html"):
             self._send(200, PAGE, "text/html; charset=utf-8")
         else:
@@ -1412,16 +1437,25 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0]
         if path == "/api/mode":
+            global _ACTIVE_MODE
+            if STDIN_MODE:
+                self._send(409, json.dumps({
+                    "ok": False,
+                    "error": "Mode is locked: incoming telemetry is piped directly from stdin (%s)" % (LANE or "stdin"),
+                    "mode": _ACTIVE_MODE,
+                    "lane": _current_lane_label(),
+                    "locked": True
+                }), "application/json")
+                return
             try:
                 nbytes = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(nbytes) if nbytes > 0 else b"{}"
                 data = json.loads(raw.decode("utf-8") or "{}")
                 m = str(data.get("mode", "")).lower().strip()
                 if m in ("band", "rtos"):
-                    global _ACTIVE_MODE
                     with _lock:
                         _ACTIVE_MODE = m
-                    self._send(200, json.dumps({"ok": True, "mode": _ACTIVE_MODE, "lane": _current_lane_label()}), "application/json")
+                    self._send(200, json.dumps({"ok": True, "mode": _ACTIVE_MODE, "lane": _current_lane_label(), "locked": False}), "application/json")
                     return
                 self._send(400, json.dumps({"error": "invalid mode (band or rtos)"}), "application/json")
             except Exception as exc:
@@ -1542,10 +1576,11 @@ def main():
     if LANE and LANE not in LANE_LABELS:
         print("error: --lane takes band or rtos (got %r)" % LANE, file=sys.stderr)
         return 2
-    threading.Thread(target=_band_collector_loop, daemon=True).start()
     if STDIN_MODE:
         threading.Thread(target=_stdin_loop, daemon=True).start()
-    threading.Thread(target=_engine_loop, daemon=True).start()
+    else:
+        threading.Thread(target=_band_collector_loop, daemon=True).start()
+        threading.Thread(target=_engine_loop, daemon=True).start()
     port = 8777
     srv = None
     for port in (8777, 8778):

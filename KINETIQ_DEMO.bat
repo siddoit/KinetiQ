@@ -44,14 +44,23 @@ start "KINETIQ 1: Mirror Dashboard" powershell -NoExit -Command "& '%~dp0laptop\
 exit /b 0
 
 :spawn_ai
+rem Ensure Ollama server is active for local LLM inference
+curl.exe -s http://127.0.0.1:11434/api/tags >nul 2>&1 || (
+    start "Ollama Server" /min ollama serve
+    timeout /t 2 /nobreak >nul
+)
 start "KINETIQ 2: Grounded AI" powershell -NoExit -Command "& '%~dp0laptop\.venv\Scripts\python.exe' '%~dp0laptop\ai\assistant.py' --query 'How am I doing?' --once --no-tts"
 exit /b 0
 
 :spawn_hero
-start "KINETIQ 3: FreeRTOS node -> Mirror  (press 3 = RUN)" powershell -NoExit -Command "& '%~dp0hardware\native\kinetiq_native.exe' --run-seconds 300 | & '%~dp0laptop\.venv\Scripts\python.exe' '%~dp0laptop\receiver\dashboard.py' --source stdin"
+start "KINETIQ 3: FreeRTOS node -> Mirror  (press 3 = RUN)" powershell -NoExit -Command "& '%~dp0hardware\native\kinetiq_native.exe' --run-seconds 3600 | & '%~dp0laptop\.venv\Scripts\python.exe' '%~dp0laptop\receiver\dashboard.py' --source stdin"
 exit /b 0
 
 :spawn_voice
+curl.exe -s http://127.0.0.1:11434/api/tags >nul 2>&1 || (
+    start "Ollama Server" /min ollama serve
+    timeout /t 2 /nobreak >nul
+)
 start "KINETIQ 4: Voice pipeline" powershell -NoExit -Command "& '%~dp0laptop\.venv\Scripts\python.exe' '%~dp0laptop\ai\voice_pipeline.py' --no-tts"
 exit /b 0
 
@@ -60,6 +69,10 @@ start "KINETIQ 5: Webcam mirror" powershell -NoExit -Command "& '%~dp0laptop\.ve
 exit /b 0
 
 :spawn_web
+curl.exe -s http://127.0.0.1:11434/api/tags >nul 2>&1 || (
+    start "Ollama Server" /min ollama serve
+    timeout /t 2 /nobreak >nul
+)
 start "KINETIQ Receiver (Band :8000)" /min powershell -NoExit -Command "$env:KINETIQ_TOKEN='poc-demo'; & '%~dp0laptop\.venv\Scripts\python.exe' '%~dp0Tharun work\Huawei-kinetiq-band6\backend\kinetiq_receiver.py'"
 start "KINETIQ WEB mirror" powershell -NoExit -Command "& '%~dp0laptop\.venv\Scripts\python.exe' '%~dp0laptop\web\app.py'"
 timeout /t 3 /nobreak >nul

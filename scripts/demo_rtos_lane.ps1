@@ -18,7 +18,7 @@ $NativeExe = Join-Path $Root "hardware\native\kinetiq_native.exe"
 $BuildPs1  = Join-Path $Root "hardware\native\build.ps1"
 $App       = Join-Path $Root "laptop\web\app.py"
 $VenvPy    = Join-Path $Root "laptop\.venv\Scripts\python.exe"
-$RunSeconds = 300
+$RunSeconds = 3600
 
 $script:Fails = 0
 $script:Warns = 0

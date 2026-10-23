@@ -105,6 +105,13 @@ Figure~\ref{fig:validation-flow} depicts the shared decision flow. Syntax alone 
 \section{Dashboard and Assistance Layer}
 The laptop dashboard runs a threaded HTTP server on loopback, tries port 8777 and then 8778 when necessary, and ingests valid JSON through standard input or application endpoints. It maintains a snapshot plus arrival and value-change times. The cards show accepted wellness context along with the source and data state. Browser-camera handling is limited to a pixel-difference motion proxy; no implemented pose or posture classifier is claimed.
 
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{ui_live.png}
+\caption{Implemented dashboard mirror rendered in the browser during a controlled local input session; the displayed stream is synthetic, not live wearable telemetry.}
+\label{fig:dashboard-live}
+\end{figure}
+
 The assistant accepts the current validated context, attempts a local Ollama \code{gemma2:2b} response where available, and otherwise uses a deterministic template. Responses are bounded to 70 words. The verifier checks specified agreement with activity, exertion, an exact HR/heart value or step count, and poor-quality wording when applicable. The process shows \texttt{PASS} or \texttt{FAIL}; the examined implementation still sends text to speech after a failed check, so the verdict is informative rather than a fail-closed safety gate.
 
 \section{Hardware Design Scope}
