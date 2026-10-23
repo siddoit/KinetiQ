@@ -3,9 +3,15 @@
 Engine mode (default): background thread ticks mock_streamer at 1 Hz.
 Stdin mode (--stdin): read JSON lines from stdin, validate, ignore non-JSON.
 
+Every projected value carries a freshness label derived inside THIS process from
+two clocks: when a line arrived, and when its data-bearing values last changed.
+The packet's own ``timestamp`` is the phone's POST time (it advances on every
+manual refresh of a cached tile), so it is never treated as freshness evidence.
+
 Usage:
     python laptop\\web\\app.py
     python laptop\\web\\app.py --stdin
+    python laptop\\web\\app.py --stdin --lane band
     hardware\\native\\kinetiq_native.exe --run-seconds 300 | python laptop\\web\\app.py --stdin
 """
 
@@ -18,6 +24,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -42,12 +50,63 @@ except ImportError:
 
 STDIN_MODE = "--stdin" in sys.argv[1:]
 
+# Display-only lane chip. Presentation metadata: never written into the
+# telemetry JSON, never seen by telemetry_schema.
+LANE_LABELS = {"band": "LANE A \u00b7 REAL BAND", "rtos": "LANE B \u00b7 RTOS CONTROL"}
+
+
+def _parse_lane(argv):
+    """Return the --lane key ("band" / "rtos"), "" when absent, "?" if valueless."""
+    for index, arg in enumerate(argv):
+        if arg == "--lane":
+            return argv[index + 1].strip().lower() if index + 1 < len(argv) else "?"
+        if arg.startswith("--lane="):
+            return arg.split("=", 1)[1].strip().lower()
+    return ""
+
+
+LANE = _parse_lane(sys.argv[1:])
+_ACTIVE_MODE = "rtos" if (LANE == "rtos") else "band"
+
+def _current_lane_label():
+    return LANE_LABELS.get(_ACTIVE_MODE, "LANE A \u00b7 REAL BAND")
+
+LANE_LABEL = _current_lane_label()
+
+# ---- freshness clocks (display-side only; never added to the JSON stream)
+_LIVE_S = 60.0      # value first seen/changed less than this ago -> LIVE
+_STALE_S = 60.0     # no arrival for longer than this -> STALE
+_OFFLINE_S = 300.0  # no arrival for longer than this -> OFFLINE
+
+# Data-bearing fields only. `timestamp` is excluded on purpose: it changes on
+# every POST even when the band re-sends an identical cached tile.
+_FINGERPRINT_FIELDS = (
+    "heart_rate",
+    "spo2",
+    "activity",
+    "motion_intensity",
+    "exertion",
+    "steps",
+    "ppg_quality",
+)
+
 _lock = threading.Lock()
 _latest = None  # type: ignore
 _history = []  # type: ignore  # list of full packet dicts, max 90
 _rejects = 0
 _start_t = time.monotonic()
 _source = "NATIVE NODE" if STDIN_MODE else "MOCK ENGINE"
+
+# Receipt clocks, monotonic seconds. Ages are always computed from these, never
+# from the packet timestamp (the phone's POST time, not the measurement time).
+_fresh = {
+    "first_seen_at": None,      # first valid line this process accepted
+    "arrival_at": None,         # most recent valid line
+    "value_changed_at": None,   # when the current fingerprint first appeared
+    "value_changed_witnessed": False,  # did we watch that transition happen?
+    "fingerprint": None,
+    "arrivals": 0,
+}
 
 # ---- camera-as-sensor state (browser motion -> server hysteresis band)
 _cam = {"motion": 0.0, "ts": 0.0, "band": "rest",
@@ -88,9 +147,15 @@ def _cam_band_update(motion, now):
 
 
 def _current_source(now=None):
+    if _ACTIVE_MODE == "band":
+        if _cam_fresh(now):
+            return "CAM + BAND 6"
+        with _lock:
+            arr = _fresh.get("arrivals", 0)
+        return "HUAWEI BAND 6" if arr > 0 else "WAITING FOR BAND"
     if STDIN_MODE:
         return "NATIVE NODE"
-    return "CAMERA" if _cam_fresh(now) else "MOCK ENGINE"
+    return "CAMERA" if _cam_fresh(now) else "FREERTOS NODE"
 
 # ---- live assistant stack (primary path: grounded on CURRENT screen packet)
 _AI = {}
@@ -340,14 +405,173 @@ def _speak_async(text):
     threading.Thread(target=_run, daemon=True).start()
 
 
+# ---- freshness derivation: exactly four states, never guessed
+def _fmt_age(seconds):
+    """Compact age: '42s' under 5 min, '7m' under an hour, '2h05m' beyond."""
+    s = int(max(0.0, float(seconds)))
+    if s < 300:
+        return "%ds" % s
+    if s < 3600:
+        return "%dm" % (s // 60)
+    h, rem = divmod(s, 3600)
+    return "%dh%02dm" % (h, rem // 60)
+
+
+def _fingerprint(packet):
+    """Stable identity of the data-bearing fields (see _FINGERPRINT_FIELDS)."""
+    out = []
+    for key in _FINGERPRINT_FIELDS:
+        value = packet.get(key)
+        if isinstance(value, float):
+            value = round(value, 4)  # kill float formatting noise, keep resolution
+        out.append(value)
+    return tuple(out)
+
+
+def _freshness(now=None):
+    """Derive LIVE / UNCHANGED / STALE / OFFLINE from the receipt clocks.
+
+    LIVE       value changed < 60 s ago             -> "changed 4s ago"
+    UNCHANGED  arrival fresh, value static >= 60 s  -> "first seen 7m ago"
+    STALE      no arrival for > 60 s                -> "no data 62s"
+    OFFLINE    no arrival for > 300 s               -> "no data 5m"
+
+    "first seen" (not "last changed") is deliberate: for the first value we
+    observe we cannot know when it started, only that we have watched it since
+    then, so the label states observation, never a claim about the band.
+    """
+    now = time.monotonic() if now is None else now
+    with _lock:
+        arrival = _fresh["arrival_at"]
+        changed = _fresh["value_changed_at"]
+        witnessed = _fresh["value_changed_witnessed"]
+        arrivals = _fresh["arrivals"]
+        first = _fresh["first_seen_at"]
+
+    if arrival is None:
+        state, label, age = "OFFLINE", "waiting for first packet", None
+    else:
+        age = max(0.0, now - arrival)
+        if age > _OFFLINE_S:
+            state, label = "OFFLINE", "no data " + _fmt_age(age)
+        elif age > _STALE_S:
+            state, label = "STALE", "no data " + _fmt_age(age)
+        else:
+            value_age = max(0.0, now - (changed if changed is not None else arrival))
+            if value_age < _LIVE_S:
+                state = "LIVE"
+                label = ("changed " if witnessed else "first seen ") + _fmt_age(value_age) + " ago"
+            else:
+                state, label = "UNCHANGED", "first seen " + _fmt_age(value_age) + " ago"
+
+    return {
+        "state": state,
+        "label": label,
+        "age_s": None if age is None else round(age, 2),
+        "value_age_s": (None if (arrival is None or changed is None)
+                        else round(max(0.0, now - changed), 2)),
+        "witnessed": bool(witnessed),
+        "first_seen_s": (None if first is None
+                         else round(max(0.0, now - first), 2)),
+        "arrivals": arrivals,
+        "live_s": _LIVE_S,
+        "stale_s": _STALE_S,
+        "offline_s": _OFFLINE_S,
+    }
+
+
+def _link(now=None):
+    """LINK liveness only: has ANY line arrived recently?
+
+    Independent of data recency so the screen can tell "phone alive, band
+    static" (LINK green + UNCHANGED) from "pipe dead" (LINK red + STALE/OFFLINE).
+    """
+    now = time.monotonic() if now is None else now
+    with _lock:
+        arrival = _fresh["arrival_at"]
+    if arrival is None:
+        return {"state": "down", "label": "LINK DOWN", "detail": "waiting for first packet"}
+    age = max(0.0, now - arrival)
+    if age <= _STALE_S:
+        return {"state": "up", "label": "LINK", "detail": "arrival " + _fmt_age(age) + " ago"}
+    return {"state": "down", "label": "LINK", "detail": "no arrival " + _fmt_age(age)}
+
+
 # ---- feeds
 def _store(packet_dict):
+    """Accept one validated packet and advance the receipt clocks."""
     global _latest, _rejects
+    now = time.monotonic()
+    fingerprint = _fingerprint(packet_dict)
     with _lock:
         _latest = packet_dict
         _history.append(packet_dict)
         while len(_history) > 90:
             _history.pop(0)
+        _fresh["arrivals"] += 1
+        _fresh["arrival_at"] = now
+        if _fresh["first_seen_at"] is None:
+            _fresh["first_seen_at"] = now
+        if _fresh["fingerprint"] != fingerprint:
+            # We only ever saw a change happen from a previous fingerprint we
+            # had already observed; the first one is "first seen", not "changed".
+            _fresh["value_changed_witnessed"] = _fresh["fingerprint"] is not None
+            _fresh["fingerprint"] = fingerprint
+            _fresh["value_changed_at"] = now
+
+
+def _band_collector_loop():
+    """Direct background collector for genuine Huawei Band 6 biometrics."""
+    while True:
+        if _ACTIVE_MODE == "band":
+            try:
+                req = urllib.request.Request(
+                    "http://127.0.0.1:8000/api/wearable/latest",
+                    headers={"Accept": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=1.8) as resp:
+                    snap = json.loads(resp.read().decode("utf-8"))
+                real = snap.get("real")
+                if isinstance(real, dict) and real.get("simulated") is False:
+                    hr = real.get("heart_rate_bpm")
+                    spo2 = real.get("spo2_percent")
+                    steps = real.get("steps", 0)
+                    if hr is not None and spo2 is not None:
+                        now = time.monotonic()
+                        if _cam_fresh(now):
+                            with _lock:
+                                m = float(_cam.get("motion", 0.0))
+                            band = _cam_band_update(m, now)
+                            activity = band if band in ("rest", "walk", "run") else "rest"
+                            intensity = min(1.0, max(0.0, m))
+                        else:
+                            activity = "rest"
+                            intensity = 0.0
+
+                        exertion = "rest"
+                        if hr >= 130:
+                            exertion = "high"
+                        elif hr >= 100:
+                            exertion = "moderate"
+                        elif hr >= 80:
+                            exertion = "light"
+
+                        pkt = {
+                            "timestamp": int(time.time()),
+                            "heart_rate": int(hr),
+                            "spo2": int(round(float(spo2))),
+                            "activity": activity,
+                            "motion_intensity": round(intensity, 2),
+                            "exertion": exertion,
+                            "steps": int(steps or 0),
+                            "ppg_quality": "good",
+                        }
+                        if TelemetryRecord:
+                            rec = TelemetryRecord.parse(pkt)
+                            _store(rec.to_dict())
+            except Exception:
+                pass
+        time.sleep(1.0)
 
 
 def _engine_loop():
@@ -355,6 +579,9 @@ def _engine_loop():
     _orig_locate = state._locate_phase
     while True:
         t0 = time.monotonic()
+        if _ACTIVE_MODE != "rtos" or STDIN_MODE:
+            time.sleep(0.5)
+            continue
         try:
             now = time.monotonic()
             if _cam_fresh(now):
@@ -396,104 +623,740 @@ def _stdin_loop():
                 _rejects += 1
 
 
-PAGE = """<!DOCTYPE html>
+PAGE = """
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <title>KINETIQ Mirror</title>
 <style>
-body{background:#0a0e14;color:#e6edf3;font-family:Segoe UI,Arial,sans-serif;margin:0}
-header{display:flex;justify-content:space-between;align-items:center;padding:12px 24px;background:#11161f;border-bottom:2px solid #1f6feb}
-h1{font-size:28px;margin:0}
-.badge{font-size:20px;font-weight:bold;padding:6px 18px;border-radius:20px}
-#src{background:#123}
-#clock{font-size:22px}
-main{display:grid;grid-template-columns:2fr 1fr;gap:16px;padding:16px 24px}
-.card{background:#11161f;border-radius:12px;padding:16px}
-#activity{font-size:84px;font-weight:900;text-align:center;margin:8px 0}
-.rest{color:#3fb950}.walk{color:#d29922}.run{color:#f85149}
-#hr{font-size:120px;font-weight:900;text-align:center;line-height:1}
-.row{display:flex;gap:16px;justify-content:space-around;text-align:center;font-size:24px}
-.big{font-size:44px;font-weight:bold}
-.bar{height:26px;background:#222;border-radius:6px;overflow:hidden}
-#mbar{height:100%;background:#1f6feb;width:0%}
-#chat{display:flex;flex-direction:column;height:520px}
-#msgs{flex:1;overflow-y:auto;background:#0d1117;border-radius:8px;padding:10px;font-size:19px}
-.m{margin:8px 0;padding:8px 12px;border-radius:8px;background:#161b22}
-.g{font-size:13px;font-weight:bold;padding:2px 10px;border-radius:10px;margin-left:8px}
-.pass{background:#0f3d1f;color:#3fb950}.fail{background:#4d1113;color:#f85149}
-#qin{display:flex;gap:8px;margin-top:8px}
-#q{flex:1;font-size:19px;padding:10px;border-radius:8px;border:1px solid #333;background:#0d1117;color:#fff}
-#send{font-size:19px;padding:10px 22px;border-radius:8px;background:#1f6feb;color:#fff;border:none}
-#mic,#spk{font-size:19px;padding:10px 14px;border-radius:8px;background:#161b22;color:#fff;border:1px solid #333}
-#mic.rec{background:#4d1113;border-color:#f85149}
-footer{padding:10px 24px;font-size:14px;color:#8b949e}
+/* ------------------------------------------------------------------------
+   KINETIQ stage mirror. Flat instrument panel: near-black bays separated by
+   1px hairlines, one blue accent (#2f81f7), semantic colours only for state.
+   Designed at 1280x720 first, scaled up to 1080p: every font-size clamp
+   carries a px floor so projection never shrinks below legibility.
+   One viewport, no page scroll, system fonts only.
+   ------------------------------------------------------------------------ */
+:root{
+  --bg:#05070a;
+  --line:rgba(255,255,255,.09);
+  --line-2:rgba(255,255,255,.16);
+  --fg:#f2f5fa;
+  --fg-2:#a9b4c3;
+  --fg-3:#7b8798;
+  --accent:#2f81f7;
+  --ok:#39e56b;
+  --warn:#ffb020;
+  --bad:#ff5347;
+  --t:190ms;
+}
+*{box-sizing:border-box}
+html{height:100%}
+body{
+  margin:0;padding:0;
+  height:100vh;width:100vw;overflow:hidden;
+  background:var(--bg);
+  color:var(--fg);
+  font-family:"Segoe UI Variable Text","Segoe UI Variable","Segoe UI",Inter,system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;
+  font-size:16px;
+  -webkit-font-smoothing:antialiased;
+  display:grid;
+  grid-template-rows:auto minmax(0,1fr) auto;
+}
+.num{font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1,"lnum" 1}
+
+/* ---- header: wordmark left, one compact status cluster right --------- */
+header{
+  display:flex;align-items:center;justify-content:space-between;
+  gap:24px;padding:10px 24px;
+  border-bottom:1px solid var(--line);
+  min-width:0;
+}
+.brand{display:flex;align-items:center;gap:12px;min-width:0}
+.mark{width:9px;height:9px;background:var(--accent);flex:0 0 auto}
+.wordmark{
+  margin:0;font-size:clamp(16px,1.9vh,19px);font-weight:800;
+  letter-spacing:.12em;line-height:1.25;white-space:nowrap;
+}
+.tag{
+  font-size:clamp(16px,1.6vh,17px);color:var(--fg-3);letter-spacing:.04em;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;
+}
+.hud{display:flex;align-items:center;gap:12px;flex:0 0 auto}
+
+/* source mode switch: band vs rtos */
+.mode-switch{
+  display:inline-flex;align-items:center;gap:3px;
+  background:rgba(255,255,255,.06);padding:3px;border-radius:4px;
+  border:1px solid var(--line-2);
+}
+.mode-btn{
+  font:inherit;font-size:clamp(12px,1.4vh,14px);font-weight:700;
+  padding:.32em .75em;background:transparent;color:var(--fg-3);
+  border:none;border-radius:3px;cursor:pointer;transition:all .15s ease;
+  white-space:nowrap;
+}
+.mode-btn:hover{color:var(--fg);background:rgba(255,255,255,.08)}
+.mode-btn.active{background:var(--accent);color:#fff}
+.mode-btn.active.rtos{background:#238636;color:#fff}
+
+/* object 1: source/lane chip - deliberately muted, the state owns attention */
+.chip{
+  display:inline-flex;align-items:center;gap:8px;
+  font-size:clamp(16px,1.6vh,16px);font-weight:600;letter-spacing:.1em;
+  color:var(--fg-3);border:1px solid var(--line);border-radius:3px;
+  padding:.42em .8em;white-space:nowrap;
+}
+.chip .sep{opacity:.6}
+#src.cam{color:#c9962f}
+
+/* object 2: the single primary state indicator */
+.stpill{
+  font-size:clamp(18px,2vh,21px);font-weight:800;letter-spacing:.14em;
+  padding:.42em .9em;border-radius:3px;white-space:nowrap;
+  border:1px solid var(--line-2);color:var(--fg-3);min-width:11ch;text-align:center;
+  transition:color var(--t) ease,background var(--t) ease,border-color var(--t) ease;
+}
+.stpill::before{
+  content:"";display:inline-block;width:.5em;height:.5em;border-radius:1px;
+  background:currentColor;margin-right:.6em;vertical-align:middle;
+}
+#stChip.LIVE{color:var(--ok);border-color:rgba(57,229,107,.5);background:rgba(57,229,107,.10)}
+#stChip.UNCHANGED{color:var(--warn);border-color:rgba(255,176,32,.5);background:rgba(255,176,32,.10)}
+#stChip.STALE{color:var(--bad);border-color:rgba(255,83,71,.5);background:rgba(255,83,71,.10)}
+#stChip.OFFLINE{color:var(--fg-3);border-color:var(--line-2);background:transparent}
+
+/* object 3: LINK dot + age + clock, one borderless muted text group */
+.linkgrp{display:flex;align-items:center;gap:12px;font-size:clamp(18px,1.8vh,20px);white-space:nowrap}
+.badge{font-weight:700;letter-spacing:.1em;color:var(--bad)}
+.badge::before{
+  content:"";display:inline-block;width:.55em;height:.55em;border-radius:50%;
+  background:currentColor;margin-right:.55em;vertical-align:middle;
+}
+.badge.up{color:var(--ok)}
+#stAge{color:var(--fg-2);min-width:20ch;font-variant-numeric:tabular-nums}
+#clock{color:var(--fg-3);min-width:8ch;font-variant-numeric:tabular-nums}
+
+/* ---- layout: vitals own the clear majority of width ------------------ */
+main{
+  display:grid;grid-template-columns:minmax(0,1fr) minmax(0,32%);
+  gap:20px;padding:20px 24px;min-height:0;overflow:hidden;
+}
+.col{display:grid;gap:16px;min-height:0;min-width:0}
+.col.left{grid-template-rows:1.35fr 1fr 0.55fr}
+.col.right{grid-template-rows:auto minmax(56px,1fr)}
+/* flat instrument bays: no card fill, no radius, no blur - hairlines only */
+.zone{
+  position:relative;min-width:0;min-height:0;overflow:hidden;
+  border:1px solid var(--line);border-radius:4px;background:transparent;
+  padding:16px 20px;display:flex;flex-direction:column;
+}
+.head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;min-width:0;flex:0 0 auto}
+.eyebrow{
+  font-size:clamp(17px,1.8vh,18px);font-weight:700;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--fg-3);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;min-width:0;
+}
+.age{
+  font-size:clamp(16px,1.6vh,17px);color:var(--fg-3);
+  white-space:nowrap;flex:0 0 auto;font-variant-numeric:tabular-nums;
+}
+.note{font-size:clamp(16px,1.6vh,17px);color:var(--fg-3);white-space:nowrap}
+/* OFFLINE only: there is genuinely nothing to show, so values blank + dim */
+.dim{opacity:.3;filter:grayscale(1);transition:opacity var(--t) ease,filter var(--t) ease}
+
+/* ---- hero: heart rate ---------------------------------------------- */
+.hero{justify-content:center;gap:8px}
+#vals{display:flex;flex-direction:column;justify-content:center;gap:6px;min-height:0}
+.hero-top{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0}
+.act{
+  font-size:clamp(18px,1.9vh,19px);font-weight:800;letter-spacing:.14em;
+  padding:.35em .8em;border-radius:3px;white-space:nowrap;min-width:5ch;text-align:center;
+  border:1px solid var(--line-2);color:var(--fg-2);
+}
+.act.rest{color:var(--ok);border-color:rgba(57,229,107,.45)}
+.act.walk{color:var(--warn);border-color:rgba(255,176,32,.45)}
+.act.run{color:var(--bad);border-color:rgba(255,83,71,.45)}
+/* BPM is baseline-anchored to the numeral at a fixed offset: min-width 3ch
+   plus tabular figures means digit-count changes never move the unit. */
+.hero-num{
+  display:flex;align-items:baseline;justify-content:center;gap:.06em;
+  font-size:clamp(96px,24vh,240px);line-height:.92;
+}
+#hr{font-weight:800;letter-spacing:-.03em;min-width:3ch;text-align:right}
+.unit{font-size:.16em;font-weight:700;letter-spacing:.14em;color:var(--fg-2)}
+#ageH{text-align:center}
+
+/* Freshness must be readable at 5 m without reading text, and no state may
+   look like a rendering failure:
+     LIVE       full white
+     UNCHANGED  numeral stays full white; age + state pill go amber
+     STALE      numeral stays full white (dimming reads as "broken" at the
+                back of a room) + subtle amber ring on the hero bay; age +
+                state pill red
+     OFFLINE    the only state allowed to blank/dim (.dim on #vals/#vals2) */
+body[data-st="UNCHANGED"] #ageH,
+body[data-st="UNCHANGED"] #ageM,
+body[data-st="UNCHANGED"] #ageS,
+body[data-st="UNCHANGED"] #stAge{color:var(--warn)}
+body[data-st="STALE"] #ageH,
+body[data-st="STALE"] #ageM,
+body[data-st="STALE"] #ageS,
+body[data-st="STALE"] #stAge{color:var(--bad)}
+body[data-st="STALE"] .hero{box-shadow:inset 0 0 0 2px rgba(255,176,32,.38)}
+
+/* ---- secondary metrics --------------------------------------------- */
+.tiles{gap:10px}
+.tiles .head,#ageM{flex:0 0 auto}
+#vals2{display:flex;flex-direction:column;gap:10px;flex:1 1 auto;min-height:0}
+.tilegrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;flex:1 1 auto;min-height:0}
+/* hairline-separated bays, not floating mini-cards */
+.tile{
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;
+  border-left:1px solid var(--line);padding:4px 8px;min-width:0;
+}
+.tile:first-child{border-left:0}
+.k{
+  font-size:clamp(17px,1.8vh,18px);font-weight:700;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--fg-3);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;max-width:100%;flex:0 0 auto;
+}
+.big{
+  font-size:clamp(30px,4.3vh,46px);font-weight:700;line-height:1.05;white-space:nowrap;
+  font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1,"lnum" 1;
+}
+/* label / bar / value read as one unit: the bar is capped instead of
+   running the full row, so the value no longer sits orphaned at the far
+   right. #mbar's % width semantics are unchanged (it fills .bar). */
+.motion{display:flex;align-items:center;gap:16px;min-width:0;flex:0 0 auto}
+.motion .k{flex:0 0 auto}
+.bar{
+  flex:0 1 min(46%,380px);min-width:120px;height:clamp(8px,1.3vh,14px);
+  background:rgba(255,255,255,.07);overflow:hidden;
+}
+#mbar{
+  display:block;height:100%;width:0%;
+  background:var(--accent);
+  transition:width var(--t) ease;
+}
+/* motion value shares the tile-value typography and right alignment */
+.motion .big{flex:0 0 auto;min-width:4ch;text-align:right}
+
+/* ---- sparkline ------------------------------------------------------ */
+.sparkcard{gap:8px}
+#spark{display:block;width:100%;flex:1 1 auto;min-height:0;height:auto}
+
+/* ---- camera + assistant -------------------------------------------- */
+.mirror{gap:10px;flex:0 0 auto}
+.mirror-row{display:flex;align-items:center;gap:12px;min-width:0;flex-wrap:wrap}
+.btn{
+  font:inherit;font-size:clamp(16px,1.6vh,16px);font-weight:700;letter-spacing:.06em;
+  padding:.55em 1em;border-radius:3px;cursor:pointer;white-space:nowrap;
+  border:1px solid var(--line-2);background:transparent;color:var(--fg);
+  transition:background var(--t) ease,border-color var(--t) ease,color var(--t) ease;
+}
+.btn:hover{background:rgba(255,255,255,.07)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{background:#4a92ff;border-color:#4a92ff}
+#camVideo{width:min(40%,200px);display:block;background:#000}
+#camCanvas{display:none}
+#camMsg{min-height:1.4em}
+.chat{gap:10px}
+.tbtn{
+  font:inherit;font-size:clamp(16px,1.6vh,16px);font-weight:700;line-height:1;
+  padding:.4em .7em;cursor:pointer;border:1px solid var(--line-2);border-radius:3px;
+  background:transparent;color:var(--fg-2);
+}
+.tbtn:hover{background:rgba(255,255,255,.07);color:var(--fg)}
+.chat .head{padding-right:44px}
+.chat .note{min-width:0;overflow:hidden;text-overflow:ellipsis}
+#chatToggle{position:absolute;top:10px;right:12px;z-index:2}
+#msgs{
+  flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;
+  padding:2px 2px 2px 0;font-size:clamp(16px,1.8vh,17px);line-height:1.5;
+  scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.2) transparent;
+}
+.m{
+  margin:0 0 10px;padding:.6em .8em;
+  border:1px solid var(--line);border-radius:3px;background:rgba(255,255,255,.028);
+  overflow-wrap:anywhere;word-break:break-word;
+}
+.g{
+  font-size:clamp(16px,1.6vh,16px);font-weight:800;letter-spacing:.08em;
+  padding:.14em .6em;border-radius:2px;margin-left:.6em;white-space:nowrap;
+}
+.pass{background:rgba(57,229,107,.14);color:var(--ok)}
+.fail{background:rgba(255,83,71,.14);color:var(--bad)}
+#qin{display:flex;gap:8px;flex:0 0 auto;min-width:0}
+#q{
+  flex:1 1 auto;min-width:0;font:inherit;font-size:clamp(16px,1.7vh,17px);
+  padding:.55em .7em;border-radius:3px;border:1px solid var(--line-2);
+  background:rgba(0,0,0,.35);color:var(--fg);
+  transition:border-color var(--t) ease,box-shadow var(--t) ease;
+}
+#q:focus{outline:none;border-color:rgba(47,129,247,.6);box-shadow:0 0 0 3px rgba(47,129,247,.15)}
+#mic.rec{border-color:rgba(255,83,71,.55);color:var(--bad);background:rgba(255,83,71,.10)}
+/* collapsed assistant = one slim ~56px bar: last reply + input + expand.
+   The input never shrinks below its min-width (130px) and the placeholder
+   is swapped to a short "Ask…" by setChat(), so nothing truncates; the
+   right padding (64px) clears the absolutely-positioned expand chevron. */
+.chat.collapsed{flex-direction:row;align-items:center;justify-content:flex-end;
+  align-self:end;gap:10px;padding:8px 64px 8px 12px}
+.chat.collapsed .head,.chat.collapsed #msgs{display:none}
+.chat.collapsed #lastReply{display:block;flex:1 1 150px}
+.chat.collapsed #qin{flex:0 0 auto}
+.chat.collapsed #q{flex:0 0 130px;min-width:130px}
+.chat.collapsed #spk,.chat.collapsed #mic{display:none}
+#lastReply{
+  display:none;font-size:clamp(16px,1.6vh,16px);color:var(--fg-2);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;
+}
+
+/* ---- status strip: diagnostics only, 13px floor ---------------------- */
+footer{
+  display:flex;align-items:center;justify-content:space-between;gap:16px;
+  padding:7px 24px;border-top:1px solid var(--line);
+  font-size:clamp(16px,1.6vh,17px);color:var(--fg-3);min-width:0;
+}
+.disc{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.diag{flex:0 0 auto;white-space:nowrap;font-variant-numeric:tabular-nums;text-align:right}
+
+@media (max-width:1180px){.tag{display:none}}
+@media (max-width:1440px){main{grid-template-columns:minmax(0,1fr) minmax(0,34%)}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 </head>
-<body>
+<body data-st="OFFLINE">
+<!-- freshness labels state observation only: "changed Ns ago" / "first seen Ns ago" / "no data Ns" -->
 <header>
-<h1>KINETIQ &mdash; the mirror that sees and answers</h1>
-<div><span class="badge" id="src">...</span> <span id="clock">--:--:--</span></div>
+<div class="brand"><span class="mark"></span><h1 class="wordmark">KINETIQ</h1><span class="tag">the mirror that sees and answers</span></div>
+<div class="hud">
+<div class="mode-switch" id="modeSwitch" title="Switch active source: Band 6 vs FreeRTOS">
+  <button id="btnModeBand" class="mode-btn active" onclick="setMode('band')">&#9200; Band 6</button>
+  <button id="btnModeRtos" class="mode-btn rtos" onclick="setMode('rtos')">&#9889; FreeRTOS</button>
+</div>
+<span class="chip"><span id="lane" style="display:none">LANE</span><span class="sep" id="laneSep" style="display:none">&middot;</span><span id="src">...</span></span>
+<span class="stpill" id="stChip">OFFLINE</span>
+<span class="linkgrp"><span class="badge" id="link">LINK</span><span id="stAge">waiting for first packet</span><span id="clock">--:--:--</span></span>
+</div>
 </header>
 <main>
-<div>
-<div class="card"><div id="activity" class="rest">REST</div>
-<div id="hr">--</div><div style="text-align:center;font-size:22px">HEART RATE (BPM)</div>
-<canvas id="spark" width="640" height="120" style="width:100%;height:120px"></canvas></div>
-<div class="card" style="margin-top:16px"><div class="row">
-<div>SpO2<div class="big" id="spo2">--</div></div>
-<div>Exertion<div class="big" id="ex">--</div></div>
-<div>Steps<div class="big" id="steps">--</div></div>
-<div>PPG<div class="big" id="ppg">--</div></div>
+<section class="col left">
+<div class="zone hero" id="heroZone">
+<div id="vals" class="dim">
+<div class="hero-top">
+<span class="eyebrow">Live vitals</span>
+<span class="act" id="activity">REST</span>
 </div>
-<div style="font-size:22px;margin-top:8px">Motion <span id="mv">0.00</span></div>
-<div class="bar"><div id="mbar"></div></div></div>
+<div class="hero-num num"><span id="hr">--</span><span class="unit">BPM</span></div>
 </div>
- <div>
- <div class="card" id="mirror"><h2 style="margin:0 0 8px">THE MIRROR SEES YOU</h2>
- <button id="camBtn" style="font-size:19px;padding:10px 18px;border-radius:8px;background:#1f6feb;color:#fff;border:none">📷 Use camera as my sensor</button>
- <div id="camMsg" style="font-size:15px;color:#8b949e;margin-top:8px">Mock engine driving — click to use your camera.</div>
- <video id="camVideo" autoplay playsinline muted style="display:none;width:240px;margin-top:8px;border-radius:8px"></video>
- <canvas id="camCanvas" width="64" height="48" style="display:none"></canvas>
- </div>
- <div class="card" id="chat" style="margin-top:16px"><h2 style="margin:0 0 8px">Ask the mirror</h2>
- <div id="msgs"><div class="m">🪞 I can see your live telemetry &mdash; ask me how you&rsquo;re doing.</div></div>
- <div id="qin"><input id="q" placeholder="How am I doing?"><button id="mic" title="Voice input (mic)">🎤</button><button id="spk" title="Spoken replies on/off">🔊</button><button id="send">Send</button></div>
- </div>
+<div class="age" id="ageH">no data yet</div>
+</div>
+<div class="zone tiles">
+<div class="head"><span class="eyebrow">Secondary metrics</span><span class="age" id="ageM">no data yet</span></div>
+<div id="vals2" class="dim">
+<div class="tilegrid">
+<div class="tile"><span class="k">SpO2</span><span class="big" id="spo2">--</span></div>
+<div class="tile"><span class="k">Exertion</span><span class="big" id="ex">--</span></div>
+<div class="tile"><span class="k">Steps</span><span class="big" id="steps">--</span></div>
+<div class="tile"><span class="k">PPG</span><span class="big" id="ppg">--</span></div>
+</div>
+<div class="motion">
+<span class="k">Motion index</span>
+<span class="bar"><span id="mbar"></span></span>
+<span class="big num" id="mv">--</span>
+</div>
+</div>
+</div>
+<div class="zone sparkcard">
+<div class="head"><span class="eyebrow">Heart rate history</span><span class="age" id="ageS">no data yet</span></div>
+<canvas id="spark" width="1200" height="140"></canvas>
+</div>
+</section>
+<section class="col right">
+<div class="zone mirror" id="mirror">
+<div class="head"><span class="eyebrow">The mirror sees you</span><span class="note">on-device only</span></div>
+<div class="mirror-row">
+<button id="camBtn" class="btn primary">&#128247; Use camera as my sensor</button>
+<video id="camVideo" autoplay playsinline muted style="display:none"></video>
+</div>
+<div class="note" id="camMsg">Click to activate camera mirror &mdash; detects your presence and greets you automatically!</div>
+<canvas id="camCanvas" width="64" height="48" style="display:none"></canvas>
+</div>
+<div class="zone chat" id="chat">
+<div class="head"><span class="eyebrow">Ask the mirror</span><span class="note">checked against live data</span></div>
+<button id="chatToggle" class="tbtn" title="Collapse assistant" aria-expanded="true" aria-label="Collapse or expand the assistant">&#9662;</button>
+<div id="msgs"><div class="m">&#129726; I can see your live telemetry &mdash; ask me how you&rsquo;re doing.</div></div>
+<div id="lastReply" title="I can see your live telemetry &mdash; ask me how you're doing.">&#129726; I can see your live telemetry &mdash; ask me how you&rsquo;re doing.</div>
+<div id="qin">
+<input id="q" placeholder="How am I doing?" autocomplete="off">
+<button id="mic" class="btn" title="Voice input (mic)">&#127908;</button>
+<button id="spk" class="btn" title="Spoken replies on/off">&#128266;</button>
+<button id="send" class="btn primary">Send</button>
+</div>
+</div>
+</section>
 </main>
-<footer>Sensors simulated (physiology engine / camera-motion / virtual IMU) &middot; answers verified against live telemetry &middot; camera motion only — no video stored or uploaded</footer>
+<footer>
+<span class="disc">Sensors simulated &middot; camera motion only &mdash; no video stored or uploaded</span>
+<span class="diag"><span id="up">uptime --</span> &middot; <span id="rej">rejected frames --</span></span>
+</footer>
 <script>
-var hrs=[];
-function draw(){var c=document.getElementById('spark'),x=c.getContext('2d');x.clearRect(0,0,c.width,c.height);if(hrs.length<2)return;var mn=Math.min.apply(0,hrs),mx=Math.max.apply(0,hrs);if(mx-mn<5){mx+=2.5;mn-=2.5;}x.strokeStyle='#1f6feb';x.lineWidth=3;x.beginPath();for(var i=0;i<hrs.length;i++){var px=i/(59)*c.width,py=c.height-((hrs[i]-mn)/(mx-mn))*(c.height-10)-5;if(i==0)x.moveTo(px,py);else x.lineTo(px,py);}x.stroke();}
-function tick(){fetch('/api/telemetry').then(function(r){return r.json()}).then(function(d){var L=d.latest;if(!L)return;var s=document.getElementById('src');s.textContent=d.source;s.style.background=d.source==='CAMERA'?'#9e6a03':'#123';var a=(L.activity||'--').toUpperCase(),el=document.getElementById('activity');el.textContent=a;el.className=a==='REST'?'rest':(a==='WALK'?'walk':'run');document.getElementById('hr').textContent=L.heart_rate;document.getElementById('spo2').textContent=L.spo2;document.getElementById('ex').textContent=L.exertion;document.getElementById('steps').textContent=L.steps;document.getElementById('ppg').textContent=L.ppg_quality;document.getElementById('mv').textContent=Number(L.motion_intensity).toFixed(2);document.getElementById('mbar').style.width=(L.motion_intensity*100)+'%';hrs=d.history.slice(-60);draw();});}
-// ---- camera as sensor: getUserMedia motion -> POST /api/camera_ingest
-var camStream=null,camPrev=null,camEMA=0,camSenseTimer=null,camPostTimer=null;
-function camStop(silent){if(camSenseTimer){clearInterval(camSenseTimer);camSenseTimer=null;}if(camPostTimer){clearInterval(camPostTimer);camPostTimer=null;}if(camStream){camStream.getTracks().forEach(function(t){t.stop();});camStream=null;}camPrev=null;var v=document.getElementById('camVideo');v.removeAttribute('srcObject');v.srcObject=null;v.style.display='none';document.getElementById('camBtn').textContent='📷 Use camera as my sensor';if(!silent)document.getElementById('camMsg').textContent='Mock engine driving — click to use your camera.';}
-function camFrame(){var v=document.getElementById('camVideo');if(!v.videoWidth)return;var c=document.getElementById('camCanvas'),x=c.getContext('2d');x.drawImage(v,0,0,64,48);var d=x.getImageData(0,0,64,48).data,g=[];for(var i=0;i<d.length;i+=4){g.push((d[i]+d[i+1]+d[i+2])/3);}if(camPrev){var s=0;for(var j=0;j<g.length;j++){s+=Math.abs(g[j]-camPrev[j]);}var raw=(s/g.length)/255;camEMA=camEMA+0.25*(raw-camEMA);}camPrev=g;}
-function camPost(){fetch('/api/camera_ingest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({motion:camEMA,activity:'auto'})}).catch(function(){});}
-document.getElementById('camBtn').onclick=function(){if(camStream){camStop();return;}if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){document.getElementById('camMsg').textContent='No camera in this browser — staying on mock engine.';return;}var btn=this;navigator.mediaDevices.getUserMedia({video:true}).then(function(stream){camStream=stream;camEMA=0;camPrev=null;var v=document.getElementById('camVideo');v.srcObject=stream;v.style.display='block';btn.textContent='⏹ Stop camera';document.getElementById('camMsg').textContent='Camera live — wave to move the mirror.';camSenseTimer=setInterval(camFrame,250);camPostTimer=setInterval(camPost,1000);}).catch(function(){document.getElementById('camMsg').textContent='Camera blocked — allow camera permission, or stay on mock engine.';});};
-setInterval(function(){document.getElementById('clock').textContent=new Date().toLocaleTimeString();},1000);
-setInterval(tick,1000);tick();
-function send(){var i=document.getElementById('q');sendText(i.value.trim());i.value='';}
-function sendText(q){if(!q)return;var m=document.getElementById('msgs');m.innerHTML+='<div class="m">🧑 '+q.replace(/</g,'&lt;')+'</div>';fetch('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q:q,tts:ttsOn})}).then(function(r){return r.json()}).then(function(d){var g=d.grounding||'FAIL',cls=g==='PASS'?'pass':'fail';m.innerHTML+='<div class="m">🪞 '+((d.answer||d.error||'?').replace(/</g,'&lt;'))+'<span class="g '+cls+'">'+g+'</span></div>';m.scrollTop=m.scrollHeight;});}
-var ttsOn=true,recorder=null,chunks=[],recTimer=null;
-document.getElementById('spk').onclick=function(){ttsOn=!ttsOn;this.textContent=ttsOn?'🔊':'🔇';};
-function micHint(t){var m=document.getElementById('msgs');m.innerHTML+='<div class="m">🎤 '+t+' — type instead, text chat keeps working.</div>';m.scrollTop=m.scrollHeight;}
-function stopMic(){if(recTimer){clearTimeout(recTimer);recTimer=null;}if(recorder&&recorder.state!=='inactive'){try{recorder.stop();}catch(e){}}var b=document.getElementById('mic');b.classList.remove('rec');b.textContent='🎤';}
-document.getElementById('mic').onclick=function(){
- if(recorder&&recorder.state!=='inactive'){stopMic();return;}
- if(!window.MediaRecorder||!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){micHint('no microphone in this browser');return;}
- var btn=this;
- navigator.mediaDevices.getUserMedia({audio:true}).then(function(stream){
-  chunks=[];try{recorder=new MediaRecorder(stream,{mimeType:'audio/webm'});}catch(e){recorder=new MediaRecorder(stream);}
-  recorder.ondataavailable=function(e){if(e.data&&e.data.size)chunks.push(e.data);};
-  recorder.onstop=function(){stream.getTracks().forEach(function(t){t.stop();});if(!chunks.length){micHint('heard nothing, try again');return;}var blob=new Blob(chunks,{type:'audio/webm'});var m=document.getElementById('msgs');m.innerHTML+='<div class="m">🎤 transcribing…</div>';m.scrollTop=m.scrollHeight;fetch('/api/transcribe',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:blob}).then(function(r){return r.json()}).then(function(d){if(d.text){m.innerHTML+='<div class="m">🧑 🎤 '+(d.text.replace(/</g,'&lt;'))+'</div>';sendText(d.text);}else{micHint('could not hear that ('+(d.error||'?')+')');}m.scrollTop=m.scrollHeight;}).catch(function(){micHint('transcription failed');});};
-  recorder.start();btn.classList.add('rec');btn.textContent='⏹';
-  recTimer=setTimeout(stopMic,10000);
- }).catch(function(){micHint('mic blocked — allow microphone permission, or type instead');});
+var hrs = [], freshLabel = 'no data yet', sw = 1, sh = 1;
+function $(id) { return document.getElementById(id); }
+
+/* ---- sparkline: heart-rate history drawn at device resolution ------- */
+function sizeSpark() {
+  var c = $('spark'), r = c.getBoundingClientRect();
+  var dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  sw = Math.max(1, Math.round(r.width));
+  sh = Math.max(1, Math.round(r.height));
+  c.width = Math.round(sw * dpr);
+  c.height = Math.round(sh * dpr);
+  c.getContext('2d').setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+function draw() {
+  var c = $('spark'), x = c.getContext('2d');
+  x.clearRect(0, 0, sw, sh);
+  /* padding on every side keeps the series clear of the card boundary at
+     720p and 1080p alike; the left gutter carries the dimmed min/max value
+     labels so the trace reads as data, not decoration. */
+  var padY = Math.max(12, sh * 0.14), padR = Math.max(12, sw * 0.012),
+      gutter = 36, i;
+  var top = padY, base = sh - padY,
+      w = Math.max(1, sw - gutter - padR),
+      h = Math.max(1, base - top);
+  if (hrs.length < 2) {
+    x.strokeStyle = 'rgba(255,255,255,.10)';
+    x.lineWidth = 1;
+    x.setLineDash([4, 6]);
+    x.beginPath();
+    x.moveTo(gutter, sh / 2);
+    x.lineTo(sw - padR, sh / 2);
+    x.stroke();
+    x.setLineDash([]);
+    return;
+  }
+  var rawMn = Math.min.apply(null, hrs), rawMx = Math.max.apply(null, hrs);
+  var mn = rawMn, mx = rawMx;
+  if (mx - mn < 5) { mx += 2.5; mn -= 2.5; }
+  var pts = [];
+  for (i = 0; i < hrs.length; i++) {
+    pts.push([gutter + i / (hrs.length - 1) * w, top + h - (hrs[i] - mn) / (mx - mn) * h]);
+  }
+  x.strokeStyle = 'rgba(255,255,255,.10)';
+  x.lineWidth = 1;
+  x.beginPath();
+  x.moveTo(gutter, base + 0.5);
+  x.lineTo(sw - padR, base + 0.5);
+  x.stroke();
+  x.lineWidth = Math.max(1.4, h / 22);
+  x.lineJoin = 'round';
+  x.lineCap = 'round';
+  x.beginPath();
+  x.moveTo(pts[0][0], pts[0][1]);
+  for (i = 1; i < pts.length; i++) { x.lineTo(pts[i][0], pts[i][1]); }
+  var grad = x.createLinearGradient(0, top, 0, base);
+  grad.addColorStop(0, 'rgba(47,129,247,.30)');
+  grad.addColorStop(1, 'rgba(47,129,247,0)');
+  x.lineTo(gutter + w, base);
+  x.lineTo(gutter, base);
+  x.closePath();
+  x.fillStyle = grad;
+  x.fill();
+  x.beginPath();
+  x.moveTo(pts[0][0], pts[0][1]);
+  for (i = 1; i < pts.length; i++) { x.lineTo(pts[i][0], pts[i][1]); }
+  x.strokeStyle = '#2f81f7';
+  x.stroke();
+  /* min/max labels in the gutter: 16px, dimmed, values only - no
+     time-window claim. Anchored to the top/bottom gridlines. */
+  x.font = '400 16px "Segoe UI",system-ui,sans-serif';
+  x.fillStyle = 'rgba(169,180,195,.8)';
+  x.textAlign = 'right';
+  x.textBaseline = 'middle';
+  x.fillText(String(Math.round(rawMx)), gutter - 6, top);
+  x.fillText(String(Math.round(rawMn)), gutter - 6, base);
+}
+
+/* ---- nothing is projected without an age: OFFLINE blanks every number
+       instead of re-showing the last cached value as if it were current. */
+function blank() {
+  $('hr').textContent = '--';
+  $('activity').textContent = '--';
+  $('activity').className = 'act';
+  $('spo2').textContent = '--';
+  $('ex').textContent = '--';
+  $('steps').textContent = '--';
+  $('ppg').textContent = '--';
+  $('mv').textContent = '--';
+  $('mbar').style.width = '0%';
+  hrs = [];
+  draw();
+}
+function fmtUptime(s) {
+  s = Number(s || 0);
+  if (s < 60) { return s + 's'; }
+  if (s < 3600) { return Math.floor(s / 60) + 'm'; }
+  var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h + 'h' + (m < 10 ? '0' : '') + m + 'm';
+}
+function tick() {
+  fetch('/api/telemetry').then(function (r) { return r.json(); }).then(function (d) {
+    var f = d.freshness || {}, lk = d.link || {}, L = d.latest;
+    var st = f.state || 'OFFLINE';
+    freshLabel = f.label || 'no data yet';
+    /* body[data-st] drives the state styling: LIVE full white, UNCHANGED
+       amber age/pill with a full-white numeral, STALE a full-white numeral
+       plus an amber ring on the hero bay, OFFLINE the only blank/dim state. */
+    document.body.setAttribute('data-st', st);
+    var chip = $('stChip');
+    chip.textContent = st;
+    chip.className = 'stpill ' + st;
+    $('stAge').textContent = freshLabel;
+    $('ageH').textContent = freshLabel;
+    $('ageM').textContent = freshLabel;
+    $('ageS').textContent = freshLabel;
+    var lb = $('link');
+    lb.textContent = lk.label || 'LINK';
+    lb.className = 'badge ' + (lk.state === 'up' ? 'up' : 'down');
+    lb.title = lk.detail || '';
+    var lane = $('lane'), lsep = $('laneSep');
+    if (d.lane) { lane.style.display = ''; lane.textContent = d.lane; lsep.style.display = ''; }
+    else { lane.style.display = 'none'; lsep.style.display = 'none'; }
+    var s = $('src');
+    s.textContent = d.source;
+    s.className = (d.source === 'CAMERA' ? 'cam' : '');
+    $('up').textContent = 'uptime ' + fmtUptime(d.uptime_s);
+    $('rej').textContent = 'rejected frames ' + (d.rejects === undefined ? '--' : d.rejects);
+    /* STALE is still data: only OFFLINE blanks and dims the numbers. */
+    $('vals').classList.toggle('dim', st === 'OFFLINE');
+    $('vals2').classList.toggle('dim', st === 'OFFLINE');
+    if (!L || st === 'OFFLINE') { blank(); return; }
+    var a = String(L.activity || '--').toUpperCase(), el = $('activity');
+    el.textContent = a;
+    el.className = 'act ' + (a === 'REST' ? 'rest' : (a === 'WALK' ? 'walk' : (a === 'RUN' ? 'run' : '')));
+    $('hr').textContent = L.heart_rate;
+    $('spo2').textContent = L.spo2;
+    $('ex').textContent = L.exertion;
+    $('steps').textContent = L.steps;
+    $('ppg').textContent = L.ppg_quality;
+    $('mv').textContent = Number(L.motion_intensity).toFixed(2);
+    $('mbar').style.width = (Number(L.motion_intensity) * 100) + '%';
+    hrs = d.history.slice(-60);
+    draw();
+    if (d.mode) { updateModeUI(d.mode); }
+  });
+}
+
+function setMode(m) {
+  fetch('/api/mode', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode: m })
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    updateModeUI(d.mode);
+  }).catch(function () {});
+}
+function updateModeUI(m) {
+  var bb = $('btnModeBand'), br = $('btnModeRtos');
+  if (bb && br) {
+    bb.classList.toggle('active', m === 'band');
+    br.classList.toggle('active', m === 'rtos');
+  }
+}
+
+/* ---- camera as sensor: getUserMedia motion -> POST /api/camera_ingest */
+var camStream = null, camPrev = null, camEMA = 0, camSenseTimer = null, camPostTimer = null;
+var presenceSeconds = 0, autoGreetDone = false, lastGreetTimestamp = 0;
+
+function checkPresenceAndGreet() {
+  var v = $('camVideo');
+  if (!v || !v.videoWidth || !camStream) {
+    presenceSeconds = 0;
+    return;
+  }
+  if (camEMA >= 0.001) {
+    presenceSeconds++;
+    $('camMsg').textContent = 'Camera live: Person detected (' + presenceSeconds + 's) — wave to move mirror.';
+  } else {
+    if (presenceSeconds > 0) presenceSeconds--;
+  }
+
+  if (presenceSeconds >= 5 && !autoGreetDone && (Date.now() - lastGreetTimestamp > 60000)) {
+    autoGreetDone = true;
+    lastGreetTimestamp = Date.now();
+    var m = $('msgs');
+    m.innerHTML += '<div class="m" style="border-color:var(--accent);color:#79c0ff">🪞 <em>Person detected in mirror range for 5s — Greeting activated!</em></div>';
+    m.scrollTop = m.scrollHeight;
+    sendText("Hello mirror, I just stepped in front of you. Greet me, tell me my live stats, and give me a health suggestion.", true);
+  }
+
+  if (presenceSeconds <= 0 && autoGreetDone && (Date.now() - lastGreetTimestamp > 15000)) {
+    autoGreetDone = false;
+  }
+}
+
+function camStop(silent) {
+  if (camSenseTimer) { clearInterval(camSenseTimer); camSenseTimer = null; }
+  if (camPostTimer) { clearInterval(camPostTimer); camPostTimer = null; }
+  if (camStream) { camStream.getTracks().forEach(function (t) { t.stop(); }); camStream = null; }
+  camPrev = null;
+  presenceSeconds = 0;
+  autoGreetDone = false;
+  var v = $('camVideo');
+  v.removeAttribute('srcObject');
+  v.srcObject = null;
+  v.style.display = 'none';
+  $('camBtn').textContent = '📷 Use camera as my sensor';
+  if (!silent) { $('camMsg').textContent = 'Click to activate camera mirror — detects your presence and greets you automatically!'; }
+}
+function camFrame() {
+  var v = $('camVideo');
+  if (!v.videoWidth) { return; }
+  var c = $('camCanvas'), x = c.getContext('2d');
+  x.drawImage(v, 0, 0, 64, 48);
+  var d = x.getImageData(0, 0, 64, 48).data, g = [], i;
+  for (i = 0; i < d.length; i += 4) { g.push((d[i] + d[i + 1] + d[i + 2]) / 3); }
+  if (camPrev) {
+    var s = 0;
+    for (i = 0; i < g.length; i++) { s += Math.abs(g[i] - camPrev[i]); }
+    var raw = (s / g.length) / 255;
+    camEMA = camEMA + 0.25 * (raw - camEMA);
+  }
+  camPrev = g;
+}
+function camPost() {
+  fetch('/api/camera_ingest', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ motion: camEMA, activity: 'auto' })
+  }).catch(function () {});
+  checkPresenceAndGreet();
+}
+$('camBtn').onclick = function () {
+  if (camStream) { camStop(); return; }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    $('camMsg').textContent = 'No camera in this browser — staying on mock engine.';
+    return;
+  }
+  var btn = this;
+  navigator.mediaDevices.getUserMedia({ video: true }).then(function (stream) {
+    camStream = stream;
+    camEMA = 0;
+    camPrev = null;
+    var v = $('camVideo');
+    v.srcObject = stream;
+    v.style.display = 'block';
+    btn.textContent = '⏹ Stop camera';
+    $('camMsg').textContent = 'Camera live — wave to move the mirror.';
+    camSenseTimer = setInterval(camFrame, 250);
+    camPostTimer = setInterval(camPost, 1000);
+  }).catch(function () {
+    $('camMsg').textContent = 'Camera blocked — allow camera permission, or stay on mock engine.';
+  });
 };
-document.getElementById('send').onclick=send;
-document.getElementById('q').onkeydown=function(e){if(e.key==='Enter')send();};
+
+setInterval(function () { $('clock').textContent = new Date().toLocaleTimeString(); }, 1000);
+
+/* ---- assistant ------------------------------------------------------ */
+var ttsOn = true, recorder = null, chunks = [], recTimer = null, chatOpen = true;
+function send() { var i = $('q'); sendText(i.value.trim()); i.value = ''; }
+function sendText(q, isAuto) {
+  if (!q) { return; }
+  var m = $('msgs');
+  if (!isAuto) {
+    m.innerHTML += '<div class="m">🧑 ' + q.replace(/</g, '&lt;') + '</div>';
+  }
+  fetch('/api/ask', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ q: q, tts: ttsOn })
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    var g = d.grounding || 'FAIL', cls = g === 'PASS' ? 'pass' : 'fail';
+    var reply = (d.answer || d.error || '?');
+    m.innerHTML += '<div class="m">🪞 ' + (reply.replace(/</g, '&lt;'))
+      + '<span class="g ' + cls + '">' + g + '</span>'
+      + '<span class="age" style="display:inline;margin-left:8px">' + freshLabel + '</span></div>';
+    m.scrollTop = m.scrollHeight;
+    /* collapsed bar shows the last reply at all times */
+    var lr = $('lastReply');
+    lr.textContent = '🪞 ' + reply;
+    lr.title = reply;
+  });
+}
+/* collapse toggle: collapsed = slim ~56px bar (last reply + input),
+   expanded = full transcript. Page never scrolls either way. */
+function setChat(open) {
+  chatOpen = open;
+  $('chat').classList.toggle('collapsed', !open);
+  /* collapsed bar is narrow: a short placeholder keeps it un-truncated */
+  $('q').placeholder = open ? 'How am I doing?' : 'Ask\u2026';
+  var b = $('chatToggle');
+  b.innerHTML = open ? '&#9662;' : '&#9652;';
+  b.title = open ? 'Collapse assistant' : 'Expand assistant';
+  b.setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open) { var m = $('msgs'); m.scrollTop = m.scrollHeight; }
+}
+$('chatToggle').onclick = function () { setChat(!chatOpen); };
+$('spk').onclick = function () { ttsOn = !ttsOn; this.textContent = ttsOn ? '🔊' : '🔇'; };
+function micHint(t) {
+  var m = $('msgs');
+  m.innerHTML += '<div class="m">🎤 ' + t + ' — type instead, text chat keeps working.</div>';
+  m.scrollTop = m.scrollHeight;
+}
+function stopMic() {
+  if (recTimer) { clearTimeout(recTimer); recTimer = null; }
+  if (recorder && recorder.state !== 'inactive') { try { recorder.stop(); } catch (e) {} }
+  var b = $('mic');
+  b.classList.remove('rec');
+  b.textContent = '🎤';
+}
+$('mic').onclick = function () {
+  if (recorder && recorder.state !== 'inactive') { stopMic(); return; }
+  if (!window.MediaRecorder || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    micHint('no microphone in this browser');
+    return;
+  }
+  var btn = this;
+  navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+    chunks = [];
+    try { recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' }); }
+    catch (e) { recorder = new MediaRecorder(stream); }
+    recorder.ondataavailable = function (e) { if (e.data && e.data.size) { chunks.push(e.data); } };
+    recorder.onstop = function () {
+      stream.getTracks().forEach(function (t) { t.stop(); });
+      if (!chunks.length) { micHint('heard nothing, try again'); return; }
+      var blob = new Blob(chunks, { type: 'audio/webm' }), m = $('msgs');
+      m.innerHTML += '<div class="m">🎤 transcribing…</div>';
+      m.scrollTop = m.scrollHeight;
+      fetch('/api/transcribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: blob
+      }).then(function (r) { return r.json(); }).then(function (d) {
+        if (d.text) {
+          m.innerHTML += '<div class="m">🧑 🎤 ' + d.text.replace(/</g, '&lt;') + '</div>';
+          sendText(d.text);
+        } else {
+          micHint('could not hear that (' + (d.error || '?') + ')');
+        }
+        m.scrollTop = m.scrollHeight;
+      }).catch(function () { micHint('transcription failed'); });
+    };
+    recorder.start();
+    btn.classList.add('rec');
+    btn.textContent = '⏹';
+    recTimer = setTimeout(stopMic, 10000);
+  }).catch(function () { micHint('mic blocked — allow microphone permission, or type instead'); });
+};
+$('send').onclick = send;
+$('q').onkeydown = function (e) { if (e.key === 'Enter') { send(); } };
+
+sizeSpark();
+setInterval(tick, 1000);
+tick();
+window.addEventListener('resize', function () { sizeSpark(); draw(); });
 </script>
 </body>
 </html>
@@ -519,8 +1382,12 @@ class Handler(BaseHTTPRequestHandler):
                 hist = [p["heart_rate"] for p in _history]
                 rej = _rejects
             body = {"latest": latest, "history": hist, "source": _current_source(),
-                    "rejects": rej, "uptime_s": int(time.monotonic() - _start_t)}
+                    "rejects": rej, "uptime_s": int(time.monotonic() - _start_t),
+                    "freshness": _freshness(), "link": _link(),
+                    "lane": _current_lane_label(), "mode": _ACTIVE_MODE}
             self._send(200, json.dumps(body), "application/json")
+        elif self.path.split("?")[0] == "/api/mode":
+            self._send(200, json.dumps({"mode": _ACTIVE_MODE, "lane": _current_lane_label()}), "application/json")
         elif self.path.split("?")[0] in ("/", "/index.html"):
             self._send(200, PAGE, "text/html; charset=utf-8")
         else:
@@ -528,6 +1395,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
+        if path == "/api/mode":
+            try:
+                nbytes = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(nbytes) if nbytes > 0 else b"{}"
+                data = json.loads(raw.decode("utf-8") or "{}")
+                m = str(data.get("mode", "")).lower().strip()
+                if m in ("band", "rtos"):
+                    global _ACTIVE_MODE
+                    with _lock:
+                        _ACTIVE_MODE = m
+                    self._send(200, json.dumps({"ok": True, "mode": _ACTIVE_MODE, "lane": _current_lane_label()}), "application/json")
+                    return
+                self._send(400, json.dumps({"error": "invalid mode (band or rtos)"}), "application/json")
+            except Exception as exc:
+                self._send(500, json.dumps({"error": str(exc)}), "application/json")
+            return
         if path == "/api/camera_ingest":
             if STDIN_MODE:
                 self._send(409, json.dumps({"error": "stdin mode ignores camera"}),
@@ -640,10 +1523,13 @@ def main():
     if StreamerState is None or TelemetryRecord is None:
         print("error: receiver modules not importable", file=sys.stderr)
         return 2
+    if LANE and LANE not in LANE_LABELS:
+        print("error: --lane takes band or rtos (got %r)" % LANE, file=sys.stderr)
+        return 2
+    threading.Thread(target=_band_collector_loop, daemon=True).start()
     if STDIN_MODE:
         threading.Thread(target=_stdin_loop, daemon=True).start()
-    else:
-        threading.Thread(target=_engine_loop, daemon=True).start()
+    threading.Thread(target=_engine_loop, daemon=True).start()
     port = 8777
     srv = None
     for port in (8777, 8778):
@@ -656,7 +1542,8 @@ def main():
         print("error: ports 8777 and 8778 are busy", file=sys.stderr)
         return 1
     url = "http://127.0.0.1:%d/" % port
-    print("KINETIQ WEB dashboard: %s  (source=%s)" % (url, _source), flush=True)
+    print("KINETIQ WEB dashboard: %s  (source=%s%s)"
+          % (url, _source, ", lane=%s" % LANE if LANE_LABEL else ""), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

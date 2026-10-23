@@ -1,0 +1,80 @@
+\chapter{OBJECTIVES AND SYSTEM REQUIREMENTS}
+
+\section{Requirement Basis}
+Requirements were derived from the documented KINETIQ software, the final-review presentation, repository tests and logs, and the stated demonstration boundary. A requirement is marked verified only when the examined source or artefact supports the stated scope. A qualified status means that an implementation or a bounded test exists but does not establish every implied operational condition. Hardware planning alone is not treated as a completed requirement.
+
+\section{Functional Requirements}
+\begin{table}[H]
+\centering
+\small
+\caption{Functional requirements and available verification evidence.}
+\label{tab:functional-requirements}
+\begin{tabularx}{\textwidth}{p{8mm}p{39mm}Yp{29mm}}
+\toprule
+\textbf{ID} & \textbf{Requirement} & \textbf{Implementation approach and evidence} & \textbf{Status}\\
+\midrule
+FR1 & Provide controlled Rest, Walk, Run, Fall, and Automatic modes. & Native FreeRTOS console maps \code{1}, \code{2}, \code{3}, \code{b}, and \code{0}/\code{a} to control state. & \tmark\\
+FR2 & Publish labelled synthetic control telemetry. & Telemetry task serialises a contract-compatible JSON payload and reports RTOS-control diagnostics. & \tmark\\
+FR3 & Receive genuine-path Huawei Health observations locally. & Android accessibility relay and authenticated POST receiver; dated receiver CSV records are available. & \pmark\\
+FR4 & Accept only complete, fresh, valid genuine bridge input. & Bridge guards require HR, SpO\textsubscript{2}, steps, non-simulated source, bounds, and live freshness. & \tmark\\
+FR5 & Enforce one eight-field telemetry schema at the mirror. & \code{telemetry\_schema.py} validates type, enumeration, and ranges before web ingestion. & \tmark\\
+FR6 & Expose source and freshness to an operator. & Dashboard maintains link and value-age state: LIVE, UNCHANGED, STALE, and OFFLINE. & \tmark\\
+FR7 & Provide sensor-conditioned wellness assistance. & Local assistant receives validated context and emits a bounded reply with a visible grounding verdict. & \pmark\\
+FR8 & Support voice interaction. & faster-whisper STT module and text-to-speech route exist; a synthesized-audio timing result is documented. & \pmark\\
+FR9 & Continue with a deterministic fallback when wearable transport is unavailable. & FreeRTOS lane remains selectable and synthetic source identity remains visible. & \tmark\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Non-Functional Requirements}
+The implementation gives equal importance to how a value is handled and what it contains. Table~\ref{tab:nonfunctional-requirements} records the operating properties relevant to a local demonstration.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Non-functional requirements and design controls.}
+\label{tab:nonfunctional-requirements}
+\begin{tabularx}{\textwidth}{p{8mm}p{35mm}Yp{31mm}}
+\toprule
+\textbf{ID} & \textbf{Property} & \textbf{Design control} & \textbf{Status}\\
+\midrule
+NFR1 & Freshness transparency & Arrival time, value-change time, and state thresholds drive explicit UI status; offline values are blanked. & \tmark\\
+NFR2 & Input reliability & Strict keys, ranges, and enumerated values reject malformed packets. & \tmark\\
+NFR3 & Observability & Native node reports period, lateness, queue HWM, drops, and missed deadlines. & \tmark\\
+NFR4 & Locality & Dashboard binds to loopback; receiver uses a local authenticated POST contract. & \pmark\\
+NFR5 & Repeatability & Console commands, mock stream, BLE mock, CSV logs, and launch scripts support bounded demonstrations. & \pmark\\
+NFR6 & Provenance safety & Genuine and RTOS paths retain different source labels; simulated input is rejected by the genuine bridge. & \tmark\\
+NFR7 & Medical safety & UI/assistant positioning remains wellness-only; no diagnostic or clinical-alert claim is made. & \tmark\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Shared Telemetry Contract}
+The browser application accepts exactly the fields in Table~\ref{tab:telemetry-contract}. The schema is intentionally narrow so that validity can be checked before the value reaches the dashboard or assistant. The Huawei bridge maps its accepted data to this contract; it does not copy arbitrary health-application fields into the mirror.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Eight-field telemetry contract enforced by the shared receiver.}
+\label{tab:telemetry-contract}
+\begin{tabularx}{\textwidth}{p{36mm}p{31mm}Y}
+\toprule
+\textbf{Field} & \textbf{Accepted form} & \textbf{Validation rule}\\
+\midrule
+\code{timestamp} & ISO-8601 string & Required; used with receiver arrival time for freshness handling.\\
+\code{heart\_rate} & numeric BPM & Required; 30--220.\\
+\code{spo2} & numeric percent & Required; 70--100.\\
+\code{activity} & string & \code{rest}, \code{walk}, \code{run}, \code{active}, or \code{unknown}.\\
+\code{motion\_intensity} & numeric & Required; 0.0--1.0.\\
+\code{exertion} & string & \code{rest}, \code{light}, \code{moderate}, or \code{high}.\\
+\code{steps} & integer & Required; non-negative.\\
+\code{ppg\_quality} & string & \code{good} or \code{poor}.\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Safety and Acceptance Boundary}
+The accepted telemetry context is a software input, not a clinical measurement guarantee. A grounding \texttt{PASS} means the implemented verifier found required contextual agreement in the generated wording; a \texttt{FAIL} indicates that one or more checks did not agree. Neither status establishes physiological correctness, medical appropriateness, or emergency safety. Emergency, diagnosis, treatment, and medication decisions remain outside the system boundary.
+
+\section{Demonstration Acceptance Conditions}
+The minimum repeatable demonstration sequence is: start the web mirror; select either the genuine bridge or the native control stream; observe source and freshness state; submit a valid contract payload; request a bounded wellness response; and inspect the diagnostic or log evidence. A genuine-path demonstration requires a fresh, complete relay snapshot. When that condition is unavailable, the operator must identify the RTOS output as synthetic control data rather than representing it as an equivalent substitute.

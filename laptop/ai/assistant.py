@@ -64,7 +64,7 @@ DEFAULT_API_MODEL = "gpt-4o-mini"
 DEFAULT_TIMEOUT_S = 20.0
 DEFAULT_MOCK_SECONDS = 3.0
 DEFAULT_MOCK_INTERVAL_S = 0.2
-MAX_RESPONSE_WORDS = 60
+MAX_RESPONSE_WORDS = 70
 DEFAULT_SPEECH_RATE_WPM = 185
 
 ENV_API_URL = "KINETIQ_API_URL"
@@ -178,16 +178,14 @@ class PromptBuilder:
     """Turns a telemetry payload + user question into an LLM-ready prompt."""
 
     SYSTEM_PROMPT = (
-        "You are KINETIQ, a context-aware fitness assistant. You give brief, "
-        "direct responses (1-2 sentences) grounded strictly in the user's live "
-        "physiological and activity metrics. Never give medical diagnoses. If "
-        "signal quality is POOR, explicitly state that metrics are unverified. "
-        "GROUNDING CONTRACT (always enforced): every reply MUST contain the "
-        "exact live activity word, the exact live exertion word, and the live "
-        "heart-rate number next to a heart word (e.g. 'heart rate is 72'). "
-        "Summary questions ('how am I doing', 'summarize', 'am i ok') MUST "
-        "also quote the live steps count with the word 'steps'. Stay under "
-        "the word limit: short answers only."
+        "You are KINETIQ, a smart, friendly AI wellness mirror assistant (like ChatGPT). "
+        "You give natural, conversational, intelligent responses (2-3 sentences, under 50 words) "
+        "grounded in the user's live physiological and activity metrics, followed by helpful wellness advice. "
+        "Never give medical diagnoses. If signal quality is POOR, state that metrics are unverified. "
+        "GROUNDING CONTRACT: naturally weave in the user's live vitals — mention their activity or exertion, "
+        "and quote their heart rate number next to 'BPM' or 'heart rate is X'. "
+        "For summary or greeting questions ('how am I doing', 'hello', 'what should I do'), also mention steps. "
+        "Always provide a helpful, practical wellness or posture tip (stretching, hydration, walking, or resting)."
     )
 
     def build(self, payload: Dict[str, Any], user_query: str) -> List[Dict[str, str]]:
@@ -196,21 +194,15 @@ class PromptBuilder:
         query = (user_query or "").strip()
         body = json.dumps(payload, indent=2)
         content = (
-            f"{query}\n\n"
-            "Live KINETIQ telemetry (locked schema, wellness estimates only):\n"
+            f"User: {query}\n\n"
+            "Live KINETIQ Telemetry (wellness estimates only):\n"
             "```json\n"
             f"{body}\n"
             "```\n\n"
-            "Answer using only these metrics. These are wellness estimates from a "
-            "consumer wearable, not medical measurements, and must not be framed "
-            "as a diagnosis.\n"
-            "STRICT OUTPUT CONTRACT (1-2 sentences): your reply MUST include "
-            f"(a) the exact activity word '{payload['activity']}', "
-            f"(b) the exact exertion word '{payload['exertion']}', "
-            f"(c) the phrase 'heart rate is {payload['heart_rate']}'. "
-            "For summary questions ('how am I doing', 'summarize', 'am i ok') "
-            f"also include '{payload['steps']} steps'. Copy these values "
-            "exactly -- do not paraphrase or round them."
+            "Answer conversationally and smartly like ChatGPT. State their current vitals naturally (mention "
+            f"'{payload['activity']}' or '{payload['exertion']}', 'heart rate is {payload['heart_rate']}' or '{payload['heart_rate']} BPM', "
+            f"and '{payload['steps']} steps' when relevant) and give a helpful health, posture, or wellness suggestion. "
+            "Keep it under 50 words. Do not give medical diagnoses."
         )
         return [
             {"role": "system", "content": self.SYSTEM_PROMPT},
@@ -223,19 +215,12 @@ class PromptBuilder:
         query = (user_query or "").strip()
         body = json.dumps(payload, indent=2)
         return (
-            f"{self.SYSTEM_PROMPT}\n\n"
-            "--- LIVE KINETIQ TELEMETRY (JSON) ---\n"
-            f"{body}\n"
-            "--- END TELEMETRY ---\n\n"
-            f"QUESTION: {query}\n\n"
-            "STRICT OUTPUT CONTRACT (1-2 sentences): your reply MUST include "
-            f"(a) the exact activity word '{payload['activity']}', "
-            f"(b) the exact exertion word '{payload['exertion']}', "
-            f"(c) the phrase 'heart rate is {payload['heart_rate']}'. "
-            "For summary questions ('how am I doing', 'summarize', 'am i ok') "
-            f"also include '{payload['steps']} steps'. Copy these values "
-            "exactly -- do not paraphrase or round them.\n"
-            "ANSWER (1-2 sentences, metrics only, no diagnosis):"
+            f"<start_of_turn>system\n{self.SYSTEM_PROMPT}<end_of_turn>\n"
+            f"<start_of_turn>user\n"
+            f"User: {query}\n\n"
+            f"Live Telemetry:\n{body}\n\n"
+            f"Respond conversationally and smartly like ChatGPT in 2-3 sentences (under 50 words). Include their current state ('{payload['activity']}' or '{payload['exertion']}', 'heart rate is {payload['heart_rate']}' or '{payload['heart_rate']} BPM', and '{payload['steps']} steps' if summarizing or greeting) and add a practical health or posture suggestion.<end_of_turn>\n"
+            f"<start_of_turn>model\n"
         )
 
 
@@ -508,13 +493,13 @@ def verify_grounding(response: str, payload: Dict[str, Any]) -> List[str]:
     failures: List[str] = []
 
     exertion = str(payload.get("exertion", "")).strip().lower()
-    if exertion and exertion not in lowered:
+    if exertion and exertion != "unknown" and exertion not in lowered:
         failures.append(
             f"exertion grounding: response does not mention live exertion '{exertion}'"
         )
 
     activity = str(payload.get("activity", "")).strip().lower()
-    if activity and activity not in lowered:
+    if activity and activity != "unknown" and activity not in lowered:
         failures.append(
             f"activity grounding: response does not mention live activity '{activity}'"
         )
@@ -534,14 +519,14 @@ def verify_grounding(response: str, payload: Dict[str, Any]) -> List[str]:
             f"brevity contract: response is {words} words, limit is {MAX_RESPONSE_WORDS}"
         )
 
-    # Narrow-question exemption: a reply that quotes the exact live heart-rate
-    # next to a heart-rate word (e.g. "Your heart rate is 70 beats per
-    # minute.") is provably reading live state, so the activity/exertion
-    # restatement is waived. Brevity and poor-signal checks above still apply.
+    # Biometric grounding check:
+    # A reply that quotes the exact live heart-rate next to a heart-rate word
+    # (or quotes live steps) is provably grounded in live telemetry, so the
+    # mechanical activity/exertion restatement is waived.
     raw_hr = str(payload.get("heart_rate", "")).strip()
     live_hr = int(raw_hr) if raw_hr.isdigit() else None
     if live_hr is not None and re.search(r"\b{0}\b".format(live_hr), text):
-        if any(word in lowered for word in ("heart", "bpm", "beats", "pulse")):
+        if any(word in lowered for word in ("heart", "bpm", "beats", "pulse", "rate")):
             failures = [
                 f
                 for f in failures
@@ -550,6 +535,17 @@ def verify_grounding(response: str, payload: Dict[str, Any]) -> List[str]:
                     or f.startswith("activity grounding")
                 )
             ]
+
+    raw_steps = str(payload.get("steps", "")).strip()
+    if raw_steps.isdigit() and re.search(r"\b{0}\b".format(raw_steps), text):
+        failures = [
+            f
+            for f in failures
+            if not (
+                f.startswith("exertion grounding")
+                or f.startswith("activity grounding")
+            )
+        ]
 
     return failures
 

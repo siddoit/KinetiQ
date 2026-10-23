@@ -140,6 +140,14 @@ class TelemetryRecord:
         Raises ValueError (TelemetryError) on any schema violation.
         """
         if isinstance(raw, (str, bytes, bytearray)):
+            if isinstance(raw, str):
+                raw = raw.strip()
+                idx = raw.find("{")
+                if idx > 0 and raw.endswith("}"):
+                    raw = raw[idx:]
+            elif isinstance(raw, (bytes, bytearray)):
+                if raw.startswith(b"\xef\xbb\xbf"):
+                    raw = raw[3:]
             try:
                 decoded = json.loads(raw)
             except (json.JSONDecodeError, UnicodeDecodeError) as exc:

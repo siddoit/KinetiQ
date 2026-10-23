@@ -1,0 +1,70 @@
+\chapter{INTRODUCTION}
+
+\section{Background and Motivation}
+Wearable devices can make physiological observations available continuously, but a value on a wearable application screen is not automatically a current, validated value at a second interface. Transport delay, incomplete packets, cached application screens, and loss of connectivity can all separate the observation from its later presentation. A wellness interface that obscures those conditions risks making stale values appear live. KINETIQ addresses that interface and integration problem with explicit provenance, freshness, and validation states.
+
+The implementation joins a Huawei Band 6 and Huawei Health data path to a laptop-based wellness mirror through a local Android accessibility streaming service and authenticated receiver. Android accessibility services are intended to observe and assist interaction with user-interface content under a user-granted permission model \cite{androidAccessibility}. No direct Huawei Band application-programming-interface integration is claimed: the genuine pathway depends on data rendered by Huawei Health and captured by the phone-side service. The distinction matters because a visible Huawei Health value, a receiver record, an accepted bridge payload, and a rendered mirror value represent different stages of evidence.
+
+KINETIQ also contains a separate native FreeRTOS v11 control pathway. Its virtual activity states and generated telemetry provide a deterministic, inspectable control demonstration when wearable transport is unavailable. FreeRTOS queues provide safe task-to-task data transfer, while mutexes protect a shared resource from concurrent access \cite{freertosQueues,freertosMutex}. The pathway is intentionally synthetic; its values are never presented as a person's physiological measurements.
+
+\section{Engineering Problem}
+Generic conversational assistance lacks direct access to the state that a user sees on a wellness dashboard. Conversely, passing arbitrary or stale telemetry to an assistant can make a fluent answer appear more reliable than its input. The engineering problem is therefore to combine local telemetry processing and wellness assistance while retaining five properties:
+
+\begin{itemize}
+  \item a traceable distinction between genuine wearable observations and synthetic control telemetry;
+  \item rejection of malformed, incomplete, simulated, or non-live input before presentation;
+  \item visible indication of transport link, source, and data freshness;
+  \item deterministic fallback behaviour with observable task timing and queue condition; and
+  \item bounded, context-conditioned wellness guidance without a diagnostic or treatment claim.
+\end{itemize}
+
+The problem is constrained by the available implementation. The current genuine pathway proves documented receiver-side records and bridge eligibility rules, not a universal end-to-end guarantee for every Huawei Health screen or measurement. Physical ESP32 sensor acquisition is similarly outside the verified final runtime. Hardware selection and Wokwi artefacts provide design and simulation evidence rather than a claim of deployed sensor readings.
+
+\section{Limitations of Unqualified Wellness Interfaces}
+An interface can be technically misleading even when every displayed number originated at a legitimate device. A heartbeat value may be historical rather than real-time; a route may drop a field; a receiver may accept a packet with an old timestamp; or a dashboard may retain its last good value after the sender disconnects. KINETIQ treats arrival time, value-change time, and freshness state as first-class UI data. After the configured offline threshold, the mirror blanks the measurement rather than retaining it in a live-looking card.
+
+The same caution applies to AI output. Context-grounded response generation can constrain an assistant to the accepted snapshot, but a displayed grounding verdict does not establish medical accuracy, clinical safety, or suitability for a particular person. KINETIQ is a wellness-assistance prototype. It does not provide medical diagnosis, treatment, emergency detection, or clinical alerting.
+
+\section{Objectives}
+The implemented objectives are organised around evidence separation and controllable operation:
+
+\begin{enumerate}
+  \item implement an observable native FreeRTOS control lane with activity commands, task timing, queue diagnostics, and synthetic telemetry;
+  \item ingest Huawei Health user-interface observations through a phone-side relay and authenticated local receiver without claiming a direct Huawei Band API;
+  \item define and enforce a shared eight-field telemetry contract before dashboard or assistant consumption;
+  \item make source, link, freshness, and quality state visible to the operator;
+  \item generate context-conditioned wellness responses with a visible grounding \texttt{PASS}/\texttt{FAIL} verdict and offline fallback; and
+  \item document repeatable demonstrations, test scope, and unverified hardware boundaries.
+\end{enumerate}
+
+\section{Scope and Boundaries}
+The laptop application is local-only in the examined configuration: its HTTP receiver binds to the loopback interface. The phone relay sends authenticated POST requests to the local receiver. The bridge emits a strict mirror schema only when HR, SpO\textsubscript{2}, and steps are present, valid, non-simulated, and classified as live by the relay contract. Stress observations are retained in documented receiver records but are not among the eight shared mirror fields and are not forwarded by the examined bridge.
+
+The control lane accepts keyboard commands \texttt{1} (Rest), \texttt{2} (Walk), \texttt{3} (Run), \texttt{b} (Fall event), and \texttt{0} (Automatic mode). It is a Windows-hosted FreeRTOS simulator and cannot establish hard real-time behaviour of a deployed microcontroller. The planned embedded scope identifies an ESP32 DevKit V1, MPU6050, HC-SR04, infrared sensing, DHT22, supporting components, and a Wokwi route. Those materials are retained as design evidence only.
+
+\section{Dual-Pathway Overview}
+Figure~\ref{fig:intro-dual} summarises the design principle. The genuine lane preserves provenance from the wearable application path. The deterministic lane supplies explicitly synthetic control telemetry. Both pass through a shared contract and dashboard surface, but their source labels remain separate. That separation prevents the control lane from becoming an unmarked substitute for a user measurement.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small, node distance=7mm and 9mm, >=Latex,
+ box/.style={draw=kinetiqBlue, rounded corners=2mm, align=center, minimum height=10mm, text width=29mm, fill=softBlue},
+ greenbox/.style={box,draw=kinetiqGreen,fill=softGreen},
+ orangebox/.style={box,draw=kinetiqOrange,fill=softOrange},
+ flow/.style={->,thick,draw=kinetiqBlue}]
+\node[greenbox] (wear) {Huawei Band 6\\Huawei Health};
+\node[greenbox,right=of wear] (relay) {Accessibility relay\\authenticated receiver};
+\node[orangebox,below=13mm of wear] (rtos) {FreeRTOS v11 control\\synthetic telemetry};
+\node[box,right=of relay,yshift=-9mm] (gate) {Shared eight-field contract\\validation and freshness};
+\node[box,right=of gate] (mirror) {Wellness mirror\\voice and grounded assistant};
+\draw[flow] (wear)--(relay);
+\draw[flow] (relay)--(gate);
+\draw[flow] (rtos.east)-| node[pos=.25,below,align=center]{source remains\\\textit{RTOS control}} (gate.south);
+\draw[flow] (gate)--(mirror);
+\end{tikzpicture}
+\caption{KINETIQ uses two telemetry pathways with a common validation and mirror interface. Green blocks carry genuine wearable-path observations; orange denotes synthetic control telemetry.}
+\label{fig:intro-dual}
+\end{figure}
+
+\section{Chapter Organisation}
+The remaining chapters establish the technical background, measurable requirements, architecture, implementation details, evidence-based results, and future integration work. The sequence moves from the evidence boundary to the mechanisms that enforce it and finally to the observations that support or qualify each claim.

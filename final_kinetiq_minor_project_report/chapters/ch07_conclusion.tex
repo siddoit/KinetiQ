@@ -1,0 +1,23 @@
+\chapter{CONCLUSION AND FUTURE SCOPE}
+
+\section{Conclusion}
+KINETIQ establishes a transparent local wellness-mirror architecture built around two non-equivalent telemetry pathways. The Huawei Band 6 route carries Huawei Health user-interface observations through an Android accessibility relay and authenticated local receiver. The native FreeRTOS v11 route supplies deterministic, explicitly synthetic control telemetry with queue and timing diagnostics. The common application layer accepts only an eight-field schema, exposes source and freshness state, and conditions assistance on the accepted context.
+
+The documented evidence supports receiver-side Huawei relay records, bridge eligibility logic, schema enforcement, dashboard mock streaming, BLE mock routing, a synthesized-audio transcription observation, and the FreeRTOS control design. It does not support a direct Huawei Band API claim, clinical validity, a completed physical ESP32 sensing node, or a claim that every documented receiver record reached the browser mirror. The report preserves those distinctions. The grounding verdict offers visible consistency feedback under a limited rule set; it is not a medical-safety certification and is not presently fail-closed.
+
+The central engineering contribution is the provenance and freshness boundary: the interface distinguishes genuine wearable-path data from RTOS control data and stops presenting offline values as current. That behaviour is more defensible for a wellness demonstration than an interface that merges valid-looking but differently sourced values without qualification.
+
+\section{Future Scope}
+Priority future work follows directly from the outstanding evidence gaps:
+
+\begin{enumerate}
+  \item complete a physical ESP32 sensor node and record calibrated MPU6050, HC-SR04, infrared, and DHT22 acquisition under stated test conditions;
+  \item create end-to-end trace fixtures that link a Huawei Health UI capture, authenticated receiver row, bridge emission, and dashboard rendering without exposing personal data;
+  \item extend the shared contract only through versioned validation, including an explicit decision on stress representation and its freshness semantics;
+  \item replace proxy mappings for motion, PPG quality, and exertion with independently measured or clearly qualified sources;
+  \item test receiver authentication, secret handling, replay behaviour, local-network exposure, and error recovery beyond the present loopback demonstration;
+  \item add automated tests for stale-to-offline blanking, assistant grounding failures, and output-gating policy; and
+  \item evaluate speech interaction with consented live audio, realistic acoustic conditions, and safety-reviewed wellness wording.
+\end{enumerate}
+
+These steps would strengthen integration confidence while retaining the current design principle: no value, label, or assistant response should imply a level of physiological or clinical certainty that the underlying evidence does not support.

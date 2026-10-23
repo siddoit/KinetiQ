@@ -1,0 +1,25 @@
+\chapter{SUPPORTING TECHNICAL INFORMATION}
+
+\section{Operator Command Map}
+\begin{table}[H]
+\centering
+\caption{Native FreeRTOS control commands.}
+\label{tab:command-map}
+\begin{tabularx}{\textwidth}{p{25mm}Yp{42mm}}
+\toprule
+\textbf{Key} & \textbf{Control state} & \textbf{Interpretation}\\
+\midrule
+\code{1} & Rest & Synthetic low-activity control state.\\
+\code{2} & Walk & Synthetic walking control state.\\
+\code{3} & Run & Synthetic running control state.\\
+\code{b} & Fall event & Simulator control event; not a validated physical fall detection.\\
+\code{0} or \code{a} & Automatic mode & Returns the virtual control logic to automatic behaviour.\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Selected Receiver Metadata}
+The genuine relay receiver retains metadata beyond the shared mirror contract: \code{received\_at}, \code{source}, \code{schema\_version}, \code{heart\_rate\_mode}, \code{spo2\_mode}, \code{stress\_mode}, \code{status}, \code{device\_model}, \code{simulated}, and \code{transport}. This metadata supports later audit of the difference between an upstream Huawei Health observation and a bridge-eligible mirror packet. It is not all displayed to the mirror.
+
+\vspace{2mm}
+\noindent\textbf{Reproduction and administrative notes.} The accompanying \code{README.md} lists the source layout and XeLaTeX/Biber compilation sequence. The logo and project visuals required by the document are stored within this folder; original project inputs remain outside it. Register numbers, academic-year entry, certificate approval date, signatures other than the named supervisor, and official signatures remain deliberately marked for authorised institutional completion.

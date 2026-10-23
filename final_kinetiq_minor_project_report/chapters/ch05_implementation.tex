@@ -1,0 +1,119 @@
+\chapter{IMPLEMENTATION AND METHODOLOGY}
+
+\section{Software Organisation}
+The implementation is organised as cooperating, deliberately narrow modules. The native FreeRTOS source at \code{hardware/native/}\allowbreak\code{kinetiq\_tasks.c} produces synthetic control messages and diagnostics. The Python receiver package contains the shared schema, BLE mock, bridge-related helpers, and local data handling. The web application at \code{laptop/web/}\allowbreak\code{app.py} owns dashboard state and exposes local endpoints. The AI and voice modules reside under \code{laptop/ai}. This separation keeps a transport adapter from becoming an unexamined source of truth for the UI.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Principal implementation modules and responsibilities.}
+\label{tab:modules}
+\begin{tabularx}{\textwidth}{p{43mm}Yp{30mm}}
+\toprule
+\textbf{Module} & \textbf{Responsibility} & \textbf{Evidence category}\\
+\midrule
+\code{kinetiq\_tasks.c} & FreeRTOS task creation, synthetic samples, activity state, queue/mutex use, timing and JSON telemetry. & Implemented native control runtime\\
+\code{telemetry\_schema.py} & Required-key, type, range, and enumeration validation for common payloads. & Implemented shared validation\\
+\code{band\_bridge.py} & Maps eligible relay snapshots to the locked mirror schema; blocks simulated, incomplete, non-live, and out-of-range input. & Implemented bridge logic\\
+\code{app.py} & Loopback dashboard server, state ageing, valid JSON ingestion, API routes, session context. & Implemented local application\\
+\code{assistant.py} & Context prompt/template, response word limit, grounding checker, TTS invocation. & Implemented assistant logic\\
+\code{voice\_pipeline.py} & Local faster-whisper transcription path and audio compatibility handling. & Implemented voice module\\
+\code{hardware/sim} & Wokwi sketch and supporting simulation configuration. & Simulation/design evidence\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{FreeRTOS Tasks, Queue, and Synchronisation}
+The control node initialises an eight-element sample queue and a mutex for the shared control state, then creates console, sensor, classification, and telemetry tasks. The sensor task produces virtual sensor samples at 100 ms. The classification task consumes queued samples once per second and uses hysteresis to reduce rapid state changes. A higher-priority telemetry task publishes a one-second status payload. Standard output ownership is confined to the telemetry task, which prevents interleaved JSON fragments from multiple writers.
+
+Timing diagnostics use a monotonic high-resolution counter on the host. For each periodic release the code records intended period, measured period, maximum lateness, queue high-water mark, dropped events, and missed deadlines. A documented lateness threshold of 120 ms contributes to the missed-deadline diagnostic. These figures aid repeatable debugging of the desktop simulator; they do not establish a scheduling bound on every Windows execution.
+
+\begin{figure}[H]
+\centering
+\resizebox{0.96\textwidth}{!}{%
+\begin{tikzpicture}[font=\small,node distance=9mm and 10mm,>=Latex,
+ task/.style={draw=kinetiqOrange,fill=softOrange,rounded corners=2mm,align=center,minimum height=10mm,text width=30mm},
+ shared/.style={draw=kinetiqBlue,fill=softBlue,rounded corners=2mm,align=center,minimum height=10mm,text width=28mm},
+ output/.style={draw=kinetiqGreen,fill=softGreen,rounded corners=2mm,align=center,minimum height=10mm,text width=30mm},
+ flow/.style={->,thick,draw=kinetiqBlue}]
+\node[task] (console) {Console task\\about 50 ms};
+\node[shared,right=of console] (mutex) {Mutex-protected\\control state};
+\node[task,below=13mm of console] (sensor) {Sensor task\\virtual IMU/DHT\\100 ms};
+\node[shared,right=of sensor] (queue) {Queue\\8 virtual samples\\HWM and drops};
+\node[task,right=of queue] (classify) {Classify task\\hysteresis\\1 Hz};
+\node[task,right=of classify] (telemetry) {Telemetry task\\synthetic JSON\\1 Hz};
+\node[output,below=13mm of telemetry] (out) {stdout contract stream\\stderr diagnostics};
+\draw[flow] (console)--(mutex);
+\draw[flow] (mutex)|- (classify);
+\draw[flow] (sensor)--(queue);
+\draw[flow] (queue)--(classify);
+\draw[flow] (classify)--(telemetry);
+\draw[flow] (telemetry)--(out);
+\end{tikzpicture}}
+\caption{Native FreeRTOS control data path. All values emitted here are synthetic RTOS-control telemetry.}
+\label{fig:rtos-dataflow}
+\end{figure}
+
+\section{Genuine-Path Ingestion and Bridging}
+The Android relay converts relevant Huawei Health interface observations into a local payload. The authenticated receiver persists each accepted relay row with source and transport metadata. The bridge then uses an all-or-nothing policy for the mirror's required physiological fields: HR, SpO\textsubscript{2}, and steps must all exist and pass range checks. Relay freshness must be \code{live}, and \code{simulated} must be false. Any failed precondition blocks forwarding.
+
+The following pseudocode captures the bridge decision without exposing application secrets or unrelated implementation detail:
+
+\begin{lstlisting}[caption={Genuine-only bridge policy, simplified.},label={lst:bridge-policy}]
+snapshot = read_latest_authenticated_relay_snapshot()
+if snapshot.simulated or snapshot.freshness != "live": reject()
+if missing(snapshot.hr, snapshot.spo2, snapshot.steps): reject()
+if not in_range(snapshot.hr, 30, 220): reject()
+if not in_range(snapshot.spo2, 70, 100): reject()
+if snapshot.steps < 0: reject()
+
+emit_to_mirror({timestamp, heart_rate, spo2, activity="unknown",
+  motion_intensity=0, exertion=bridge_heuristic(...),
+  steps, ppg_quality="good"})
+\end{lstlisting}
+
+The PPG-quality assignment is an upstream-completion proxy, not a signal-quality algorithm. The exertion field is a bridge heuristic. The reporting language therefore treats the bridge output as validated transport context with selected derived fields, not as a fully measured physiological model.
+
+\section{Schema Validation and Dashboard State}
+The web ingress parses JSON, validates the eight required keys, and ignores non-JSON standard-input lines. The validator restricts activity to \code{rest}, \code{walk}, \code{run}, \code{active}, or \code{unknown}; exertion to \code{rest}, \code{light}, \code{moderate}, or \code{high}; and PPG quality to \code{good} or \code{poor}. Numeric boundaries are listed in Table~\ref{tab:telemetry-contract}. Rejected packets do not replace the accepted wellness snapshot.
+
+Freshness is implemented in the web layer with a 60 s live interval, a subsequent 60 s stale interval, and an offline limit at 300 s. The code additionally detects whether a newly arriving packet changed the snapshot fingerprint. This distinguishes a recently arriving repeated value (\texttt{UNCHANGED}) from a value that has stopped arriving (\texttt{STALE} or \texttt{OFFLINE}). The value display is blanked in the offline condition.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Dashboard freshness and link-state treatment.}
+\label{tab:freshness-states}
+\begin{tabularx}{\textwidth}{p{35mm}p{36mm}Y}
+\toprule
+\textbf{State} & \textbf{Condition in examined UI logic} & \textbf{Interface consequence}\\
+\midrule
+LIVE & Recent arrival with a changed fingerprint inside the live interval. & Current card and source state are displayed.\\
+UNCHANGED & Recent arrival but repeated fingerprint. & Card remains visible; repetition is not disguised as a changed sample.\\
+STALE & Arrival age exceeds the live interval but remains below offline threshold. & Stale status is visible.\\
+OFFLINE & Arrival age exceeds 300 s. & Documented interface blanks measurement values and shows offline state.\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Grounded Assistance and Voice Route}
+The assistant constructs a local context containing accepted telemetry fields and generates through an optional local Ollama \code{gemma2:2b} endpoint. When that endpoint is unavailable, a deterministic template remains available. The response is limited to 70 words. The verifier inspects required contextual mentions: activity and exertion normally appear in the response; an exact heart-rate/heart wording or exact step count relaxes the requirement for both; and poor PPG quality requires qualifying language. The result is surfaced as \texttt{PASS} or \texttt{FAIL} in the application.
+
+Speech input is transcribed through faster-whisper \code{tiny.en} with \code{int8} inference. Text-to-speech is invoked for the generated answer. A synthetic-clip result measures the transcription route in a controlled condition only. Browser camera input, where used, supplies a motion proxy based on frame-pixel differences and is not a body-pose system.
+
+\section{Launch and Fallback Procedure}
+The reproducible operator route is deliberately simple:
+
+\begin{enumerate}
+  \item start the local web application and confirm its loopback port;
+  \item start the authenticated receiver and either the genuine-only bridge or the native FreeRTOS control executable;
+  \item inspect the dashboard source and freshness card before discussing a value;
+  \item use a fresh complete Huawei relay snapshot only when a genuine-path demonstration is required;
+  \item select the RTOS lane when transport is unavailable, retaining its synthetic label; and
+  \item retain console diagnostics and CSV/session artefacts for the demonstration record.
+\end{enumerate}
+
+The fallback retains operability, not equivalence: RTOS synthetic values cannot substitute for unavailable wearable observations.
+
+\section{Hardware Simulation and Integration Status}
+The Wokwi sketch models the embedded direction with task-oriented code and simulated inputs. It supports early pin and logic exploration. The selected physical BOM and pin map support planned assembly, but the final documented demonstration does not claim newly acquired ESP32 readings. No section of the runtime validation should be interpreted as a completed physical MPU6050, HC-SR04, infrared, or DHT22 integration.

@@ -26,6 +26,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <windows.h>    /* QueryPerformanceCounter: real wall-clock deadlines */
+
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
@@ -55,6 +57,16 @@
 #define FALL_DURATION_MS    ( 8000UL )
 
 #define SAMPLE_QUEUE_LEN    ( 8 )
+
+/* ---- Diagnostic contracts (stderr readout, instrumentation only) ---- */
+#define TELEMETRY_PERIOD_MS ( 1000UL )      /* nominal 1 Hz telemetry cadence */
+/* Lateness beyond nominal that counts as a genuine missed deadline.
+ * The Windows FreeRTOS port's simulated tick source runs ~8% slow: a nominal
+ * 1000 ms period measures ~1072-1086 ms on real wall-clock. A tight tolerance
+ * (50 ms) therefore counted simulator tick drift as a missed deadline, not a
+ * scheduling miss. Keep the `measured <n>ms` diag field: it is what makes that
+ * drift visible and keeps the miss count honest. */
+#define DEADLINE_SLIP_MS    ( 120UL )       /* lateness beyond nominal = missed */
 
 /* Autonomous scenario loop: (band, dwell s). "recover" reuses the rest
  * band — the story is told by the still-elevated, falling heart rate,
@@ -87,6 +99,16 @@ static SharedState_t g_shared;
 static QueueHandle_t g_sampleQ = NULL;
 static SemaphoreHandle_t g_mutex = NULL;
 
+/* ---- Honest queue diagnostics (written by the sensor task only) ----
+ * g_q_hwm is re-derived from uxQueueMessagesWaiting() after every successful
+ * enqueue instead of being incremented blindly, so it can never drift above
+ * the real queue capacity (and it is a plain max: it never decreases while
+ * the run is alive, i.e. it survives every drain). Each counter has exactly
+ * one writer and an aligned 32-bit load/store is atomic on this port, so the
+ * reader in the telemetry task needs no lock. */
+static volatile uint32_t g_q_hwm   = 0;     /* deepest g_sampleQ depth seen */
+static volatile uint32_t g_q_drops = 0;     /* samples discarded when full  */
+
 /* ---- Telemetry history (owned solely by the telemetry task) ---- */
 static float g_hr = HR_BASELINE;
 static float g_steps = 4218.0f;
@@ -95,6 +117,33 @@ static int   g_winCount = 0;
 static int   g_winPos = 0;
 static TickType_t g_runOnset = 0;
 static int   g_wasRun = 0;
+
+/* ---- Deadline diagnostics (owned solely by the telemetry task) ----
+ * Derived from the monotonic wall clock, never from the assumption that
+ * vTaskDelayUntil() is exact: if the analysis or printing overruns the
+ * nominal period, that is recorded here and reported honestly. */
+static uint32_t g_max_lateness_ms  = 0;
+static uint32_t g_missed_deadlines = 0;
+static uint64_t g_period_sum_ms    = 0;     /* for the reported mean cadence */
+static uint32_t g_period_samples   = 0;
+
+/* Monotonic wall clock in ms (QueryPerformanceCounter), for deadline accounting
+ * only. Ticks on this port are produced by a nominal SetWaitableTimer step, so a
+ * tick delta always looks like exactly 1000 ticks even when the real thread was
+ * starved for half a second — measuring lateness in ticks would be a polite lie.
+ * QPC is monotonic and unaffected by that. Telemetry task only. */
+static uint64_t mono_ms( void )
+{
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER c;
+
+    if( freq.QuadPart == 0 )
+    {
+        QueryPerformanceFrequency( &freq );
+    }
+    QueryPerformanceCounter( &c );
+    return ( uint64_t ) ( ( c.QuadPart * 1000LL ) / freq.QuadPart );
+}
 
 /* Uniform float in [lo, hi). rand() is called from sensor/telemetry/classify
  * tasks; on this port each task is a Windows thread, and MSVCRT rand() is
@@ -292,12 +341,26 @@ static void vSensorTask( void * pv )
             s.seq = seq++;
         }
 
-        /* Small queue, newest wins: drop the oldest sample if full. */
+        /* Small queue, newest wins: drop the oldest sample if full.
+         * Deliberate design (the 10 Hz producer simply outruns the 1 Hz
+         * consumer) — counted, because pretending it never happens is worse
+         * than reporting it. */
         if( xQueueSend( g_sampleQ, &s, 0 ) != pdPASS )
         {
             SensorSample_t drop;
             ( void ) xQueueReceive( g_sampleQ, &drop, 0 );
             ( void ) xQueueSend( g_sampleQ, &s, 0 );
+            g_q_drops++;
+        }
+
+        /* High-water mark: measured depth, clamped by construction to the
+         * real queue length because it comes from the queue itself. */
+        {
+            uint32_t depth = ( uint32_t ) uxQueueMessagesWaiting( g_sampleQ );
+            if( depth > g_q_hwm )
+            {
+                g_q_hwm = depth;
+            }
         }
 
         vTaskDelayUntil( &wake, pdMS_TO_TICKS( 100 ) );
@@ -341,10 +404,11 @@ static void vClassifyTask( void * pv )
 static void vTelemetryTask( void * pv )
 {
     TickType_t wake = xTaskGetTickCount();
+    uint64_t prev_ms = mono_ms();        /* origin for the measured period */
     ( void ) pv;
 
     /* Let sensor + classify settle so the first packet already has a story. */
-    vTaskDelayUntil( &wake, pdMS_TO_TICKS( 1000 ) );
+    vTaskDelayUntil( &wake, pdMS_TO_TICKS( TELEMETRY_PERIOD_MS ) );
 
     for( ;; )
     {
@@ -354,6 +418,29 @@ static void vTelemetryTask( void * pv )
         float motion;
         char notice[ 128 ];
         int bell = 0, haveNotice = 0, wantHelp = 0;
+
+        /* Measured cadence from the monotonic wall clock, not from ticks and
+         * not from the assumption that vTaskDelayUntil() is exact. */
+        uint64_t t_now = mono_ms();
+        uint32_t period_ms = ( t_now > prev_ms ) ? ( uint32_t ) ( t_now - prev_ms ) : 0;
+        prev_ms = t_now;
+        if( period_ms > 0 )
+        {
+            g_period_sum_ms += period_ms;
+            g_period_samples++;
+        }
+        if( period_ms > ( uint32_t ) TELEMETRY_PERIOD_MS )
+        {
+            uint32_t late = period_ms - ( uint32_t ) TELEMETRY_PERIOD_MS;
+            if( late > g_max_lateness_ms )
+            {
+                g_max_lateness_ms = late;
+            }
+            if( late > ( uint32_t ) DEADLINE_SLIP_MS )
+            {
+                g_missed_deadlines++;
+            }
+        }
 
         if( xSemaphoreTake( g_mutex, portMAX_DELAY ) == pdTRUE )
         {
@@ -474,6 +561,23 @@ static void vTelemetryTask( void * pv )
                  ( unsigned long ) uxTaskGetNumberOfTasks(),
                  ( unsigned long ) uptime_s,
                  ( unsigned ) xPortGetFreeHeapSize() );
+        /* Diagnostics tell the real story: producer (10 Hz) outruns the
+         * consumer (1 Hz), so the queue sits at hwm 8/8 and samples are
+         * discarded oldest-first on purpose. stderr only — stdout stays
+         * schema JSON. */
+        fprintf( stderr,
+                 "diag: period %lums measured %lums | max lateness %lums | "
+                 "queue hwm %lu/%d | drops %lu (oldest-first, by design) | "
+                 "missed %lu\n",
+                 ( unsigned long ) TELEMETRY_PERIOD_MS,
+                 ( unsigned long ) ( ( g_period_samples > 0 )
+                                     ? ( uint32_t ) ( g_period_sum_ms / g_period_samples )
+                                     : 0UL ),
+                 ( unsigned long ) g_max_lateness_ms,
+                 ( unsigned long ) g_q_hwm,
+                 ( int ) SAMPLE_QUEUE_LEN,
+                 ( unsigned long ) g_q_drops,
+                 ( unsigned long ) g_missed_deadlines );
         printf( "{\"timestamp\":%ld,\"heart_rate\":%d,\"spo2\":%d,"
                 "\"activity\":\"%s\",\"motion_intensity\":%.2f,"
                 "\"exertion\":\"%s\",\"steps\":%d,\"ppg_quality\":\"%s\"}\n",
@@ -483,7 +587,7 @@ static void vTelemetryTask( void * pv )
         fflush( stdout );
         fflush( stderr );
 
-        vTaskDelayUntil( &wake, pdMS_TO_TICKS( 1000 ) );
+        vTaskDelayUntil( &wake, pdMS_TO_TICKS( TELEMETRY_PERIOD_MS ) );
     }
 }
 

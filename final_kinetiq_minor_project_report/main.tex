@@ -1,0 +1,175 @@
+% KINETIQ B.Tech Minor Project Report
+% Build with: xelatex main && biber main && xelatex main && xelatex main
+\documentclass[12pt,a4paper,oneside]{report}
+
+\usepackage[a4paper,top=25mm,bottom=25mm,left=32mm,right=25mm]{geometry}
+\usepackage{fontspec}
+\setmainfont{TeX Gyre Termes}
+\setsansfont{TeX Gyre Heros}
+\usepackage{microtype}
+\usepackage{setspace}
+\onehalfspacing
+\usepackage{graphicx}
+\graphicspath{{figures/}}
+\usepackage{booktabs,tabularx,longtable,array,multirow}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{caption,subcaption}
+\usepackage[table]{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,calc}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{listings}
+\usepackage{csquotes}
+\usepackage[backend=biber,style=numeric,sorting=none,maxbibnames=99]{biblatex}
+\addbibresource{references.bib}
+\usepackage[colorlinks=true,linkcolor=black,citecolor=black,urlcolor=blue!60!black,pdfauthor={Sidharth Sajith and Tharun Oommen Jacob},pdftitle={KINETIQ -- Real-Time Wellness Mirror with FreeRTOS and Sensor-Grounded AI}]{hyperref}
+
+\definecolor{kinetiqBlue}{HTML}{173B61}
+\definecolor{kinetiqTeal}{HTML}{147D7E}
+\definecolor{kinetiqGreen}{HTML}{3B7A57}
+\definecolor{kinetiqOrange}{HTML}{B96A1B}
+\definecolor{softBlue}{HTML}{EAF2F8}
+\definecolor{softGreen}{HTML}{EAF5EC}
+\definecolor{softOrange}{HTML}{FFF3E4}
+\definecolor{softGray}{HTML}{F3F5F6}
+
+\captionsetup{font=small,labelfont=bf,justification=centering}
+\setlist[itemize]{leftmargin=7mm,noitemsep,topsep=2pt}
+\setlist[enumerate]{leftmargin=8mm,noitemsep,topsep=2pt}
+\renewcommand{\arraystretch}{1.22}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcolumntype{C}{>{\centering\arraybackslash}m{0.15\textwidth}}
+\newcommand{\placeholder}[1]{\textit{[#1]}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\tmark}{\textcolor{kinetiqGreen}{\textbf{Verified}}}
+\newcommand{\pmark}{\textcolor{kinetiqOrange}{\textbf{Qualified}}}
+\newcommand{\nmark}{\textcolor{red!65!black}{\textbf{Not demonstrated}}}
+
+\titleformat{\chapter}[display]
+  {\normalfont\bfseries\color{kinetiqBlue}}
+  {\filleft\Large CHAPTER \thechapter}
+  {1ex}{\titlerule\vspace{1.2ex}\filright\Huge}
+\titlespacing*{\chapter}{0pt}{-10pt}{20pt}
+\titleformat{\section}{\large\bfseries\color{kinetiqBlue}}{\thesection}{0.75em}{}
+\titleformat{\subsection}{\normalsize\bfseries\color{kinetiqTeal}}{\thesubsection}{0.75em}{}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small KINETIQ}
+\fancyhead[R]{\small Real-Time Wellness Mirror}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.3pt}
+\setlength{\headheight}{15pt}
+\fancypagestyle{plain}{\fancyhf{}\fancyfoot[C]{\thepage}\renewcommand{\headrulewidth}{0pt}}
+
+\lstset{basicstyle=\ttfamily\footnotesize,frame=single,breaklines=true,backgroundcolor=\color{softGray},xleftmargin=2mm,xrightmargin=2mm}
+
+\begin{document}
+\pagenumbering{roman}
+\begin{titlepage}
+  \centering
+  \vspace*{9mm}
+  \includegraphics[width=27mm]{ppt_image1.png}\par\vspace{8mm}
+  {\Large\bfseries SAINTGITS COLLEGE OF ENGINEERING\par}
+  {\large (Autonomous), Kottayam\par}
+  \vspace{13mm}
+  {\Large\bfseries B.TECH MINOR PROJECT REPORT\par}
+  \vspace{11mm}
+  {\large entitled\par}\vspace{5mm}
+  {\LARGE\bfseries\color{kinetiqBlue} KINETIQ\par}
+  \vspace{3mm}
+  {\Large\bfseries Real-Time Wellness Mirror with FreeRTOS and Sensor-Grounded AI\par}
+  \vspace{13mm}
+  {\large Submitted by\par}\vspace{4mm}
+  {\large\bfseries Sidharth Sajith \quad and \quad Tharun Oommen Jacob\par}
+  \vspace{12mm}
+  {\large Under the guidance of\par}\vspace{4mm}
+  {\large\bfseries Er. Jittu George Eapen\par}
+  {\large Assistant Professor\par}
+  \vfill
+  {\large\bfseries Department of Electronics Engineering\par}
+  \vspace{4mm}
+  {\large Saintgits College of Engineering (Autonomous), Kottayam\par}
+  \vspace{7mm}
+  {\large Academic year: \placeholder{to be entered by the department}\par}
+\end{titlepage}
+
+\clearpage
+\thispagestyle{empty}
+\begin{center}
+{\Large\bfseries CERTIFICATE}\par\vspace{14mm}
+\end{center}
+\noindent This is to certify that the B.Tech Minor Project entitled \textbf{``KINETIQ -- Real-Time Wellness Mirror with FreeRTOS and Sensor-Grounded AI''} is a record of work carried out by \textbf{Sidharth Sajith} and \textbf{Tharun Oommen Jacob} in the Department of Electronics Engineering, Saintgits College of Engineering (Autonomous), Kottayam, under the guidance of \textbf{Er. Jittu George Eapen}, Assistant Professor. The institutional approvals, register numbers, submission date, and signatures shall be completed by the authorised office.
+\vspace{28mm}
+\begin{tabularx}{\textwidth}{>{\centering\arraybackslash}Y >{\centering\arraybackslash}Y}
+\rule{55mm}{0.4pt}\par Supervisor\par Er. Jittu George Eapen &
+\rule{55mm}{0.4pt}\par Head of Department\par \placeholder{Authorised signatory}\\[25mm]
+\rule{55mm}{0.4pt}\par Project Coordinator\par \placeholder{Authorised signatory} &
+\rule{55mm}{0.4pt}\par Principal\par \placeholder{Authorised signatory}\\
+\end{tabularx}
+\vfill
+\noindent Place: Kottayam \hfill Date: \placeholder{to be entered}
+
+\clearpage
+\chapter*{ACKNOWLEDGEMENTS}
+\addcontentsline{toc}{chapter}{Acknowledgements}
+The authors record sincere gratitude to Er. Jittu George Eapen, Assistant Professor, for technical guidance and review. Appreciation is extended to the Department of Electronics Engineering and Saintgits College of Engineering (Autonomous) for the academic environment supporting the work. The documented implementation also benefited from the project team's test materials, device records, and software artefacts.
+
+\clearpage
+\chapter*{ABSTRACT}
+\addcontentsline{toc}{chapter}{Abstract}
+KINETIQ is a local wellness-mirror prototype that combines two deliberately distinct telemetry pathways with a common validation and assistance layer. The genuine-data pathway transports observations from a Huawei Band 6 through Huawei Health and an Android accessibility streaming service to an authenticated local receiver. The receiver and bridge admit only complete, fresh, non-simulated values before forwarding a constrained mirror payload. A separate native FreeRTOS v11 application demonstrates deterministic activity-control behaviour with synthetic telemetry, queue and timing diagnostics, and an operator-controlled fallback. Both pathways terminate at a laptop-based mirror that exposes source, link, freshness, and data-quality state instead of presenting cached values as live.
+
+The shared contract contains eight fields: timestamp, heart rate, oxygen saturation, activity, motion intensity, exertion, steps, and PPG quality. Schema, range, completeness, source, and freshness checks gate dashboard and assistant inputs. The assistant receives accepted context, returns a bounded wellness-oriented response, displays a grounding verdict, and retains an offline deterministic template when the optional local language-model service is unavailable. The implementation is explicitly non-clinical: it neither diagnoses nor treats a condition.
+
+Repository evidence includes authenticated receiver records containing 60 BPM, 100\% SpO\textsubscript{2}, stress 57, and 4,181 steps on 22 October 2026; a separate synthetic dashboard session containing 75 frames over 15 seconds with no recorded drops; a 30-message BLE mock; and a 0.48 s faster-whisper result on synthesized audio. These observations establish bounded portions of the pipeline only. Physical ESP32 sensing remains represented by component selection and Wokwi simulation rather than a verified final hardware acquisition.
+
+\noindent\textbf{Keywords:} FreeRTOS, wearable telemetry, data freshness, wellness mirror, schema validation, sensor-grounded AI, Huawei Health.
+
+\clearpage
+\tableofcontents
+\clearpage
+\listoffigures
+\addcontentsline{toc}{chapter}{List of Figures}
+\clearpage
+\listoftables
+\addcontentsline{toc}{chapter}{List of Tables}
+\clearpage
+\chapter*{ABBREVIATIONS}
+\addcontentsline{toc}{chapter}{Abbreviations}
+\begin{longtable}{p{38mm}p{105mm}}
+\textbf{AI} & Artificial Intelligence \\
+\textbf{BLE} & Bluetooth Low Energy \\
+\textbf{BOM} & Bill of Materials \\
+\textbf{CSV} & Comma-Separated Values \\
+\textbf{ESP32} & Espressif 32-bit microcontroller family \\
+\textbf{HWM} & High-Water Mark \\
+\textbf{IMU} & Inertial Measurement Unit \\
+\textbf{JSON} & JavaScript Object Notation \\
+\textbf{LLM} & Large Language Model \\
+\textbf{PPG} & Photoplethysmography \\
+\textbf{RTOS} & Real-Time Operating System \\
+\textbf{SpO\textsubscript{2}} & Peripheral oxygen saturation \\
+\textbf{STT} & Speech-to-Text \\
+\textbf{TTS} & Text-to-Speech \\
+\textbf{UI} & User Interface
+\end{longtable}
+
+\clearpage
+\pagenumbering{arabic}
+\setcounter{page}{1}
+\include{chapters/ch01_introduction}
+\include{chapters/ch02_literature}
+\include{chapters/ch03_requirements}
+\include{chapters/ch04_design}
+\include{chapters/ch05_implementation}
+\include{chapters/ch06_results}
+\include{chapters/ch07_conclusion}
+\appendix
+\include{chapters/appendices}
+
+\clearpage
+\printbibliography[heading=bibintoc,title={REFERENCES}]
+\end{document}

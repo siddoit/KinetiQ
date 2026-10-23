@@ -60,7 +60,8 @@ start "KINETIQ 5: Webcam mirror" powershell -NoExit -Command "& '%~dp0laptop\.ve
 exit /b 0
 
 :spawn_web
-start "KINETIQ WEB server" powershell -NoExit -Command "& '%~dp0laptop\.venv\Scripts\python.exe' '%~dp0laptop\web\app.py'"
+start "KINETIQ Receiver (Band :8000)" /min powershell -NoExit -Command "$env:KINETIQ_TOKEN='poc-demo'; & '%~dp0laptop\.venv\Scripts\python.exe' '%~dp0Tharun work\Huawei-kinetiq-band6\backend\kinetiq_receiver.py'"
+start "KINETIQ WEB mirror" powershell -NoExit -Command "& '%~dp0laptop\.venv\Scripts\python.exe' '%~dp0laptop\web\app.py'"
 timeout /t 3 /nobreak >nul
 start "" "http://127.0.0.1:8777"
 exit /b 0
