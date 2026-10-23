@@ -37,7 +37,7 @@ KINETIQ has a sensing/control tier, a local transport and validation tier, and a
 \draw[flow] (bridge)--(schema);
 \draw[flow] (schema)--(mirror);
 \end{tikzpicture}
-\caption{Overall KINETIQ architecture. The two source lanes converge only after their origin and eligibility are made explicit.}
+\caption[Overall KINETIQ architecture]{Overall KINETIQ architecture. The two source lanes converge only after their origin and eligibility are made explicit.}
 \label{fig:overall-architecture}
 \end{figure}
 
@@ -98,7 +98,7 @@ Figure~\ref{fig:validation-flow} depicts the shared decision flow. Syntax alone 
 \draw[flow] (source)-| node[pos=.25,below,font=\scriptsize]{no} (reject);
 \draw[flow] (dash)--(assist);
 \end{tikzpicture}}
-\caption{Validation and freshness workflow. The genuine bridge adds source-specific completeness and live-freshness guards before it emits the shared contract.}
+\caption[Validation and freshness workflow]{Validation and freshness workflow. The genuine bridge adds source-specific completeness and live-freshness guards before it emits the shared contract.}
 \label{fig:validation-flow}
 \end{figure}
 
@@ -112,7 +112,9 @@ The laptop dashboard runs a threaded HTTP server on loopback, tries port 8777 an
 \label{fig:dashboard-live}
 \end{figure}
 
-The assistant accepts the current validated context, attempts a local Ollama \code{gemma2:2b} response where available, and otherwise uses a deterministic template. Responses are bounded to 70 words.
+The assistant accepts the current validated context, attempts a local Ollama \code{gemma2:2b} response where available, and otherwise uses a deterministic template.
+
+Responses are bounded to 70 words.
 
 The verifier checks specified agreement with activity, exertion, an exact HR/heart value or step count, and poor-quality wording when applicable. The process shows \texttt{PASS} or \texttt{FAIL}; the examined implementation still sends text to speech after a failed check, so the verdict is informative rather than a fail-closed safety gate.
 
@@ -122,7 +124,7 @@ The selected embedded components are an ESP32 DevKit V1, MPU6050, HC-SR04, infra
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.82\textwidth]{existing_architecture.png}
-\caption{Earlier hardware-path conceptual architecture from the KINETIQ project materials. The physical ESP32 sensing path remained planned/simulated at the documented final demonstration.}
+\caption[Earlier hardware-path conceptual architecture]{Earlier hardware-path conceptual architecture from the KINETIQ project materials. The physical ESP32 sensing path remained planned/simulated at the documented final demonstration.}
 \label{fig:hardware-concept}
 \end{figure}
 

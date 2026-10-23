@@ -29,6 +29,13 @@ import time
 import wave
 from typing import Any, Dict, List, Optional
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 _AI_DIR = os.path.dirname(os.path.abspath(__file__))
 if _AI_DIR not in sys.path:
     sys.path.insert(0, _AI_DIR)

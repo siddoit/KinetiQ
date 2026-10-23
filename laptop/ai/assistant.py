@@ -49,6 +49,13 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # The telemetry contract lives in laptop/receiver; make it importable no matter
 # which directory this file was launched from (Windows-safe, no POSIX tricks).
 _LAPTOP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -64,7 +71,7 @@ DEFAULT_API_MODEL = "gpt-4o-mini"
 DEFAULT_TIMEOUT_S = 20.0
 DEFAULT_MOCK_SECONDS = 3.0
 DEFAULT_MOCK_INTERVAL_S = 0.2
-MAX_RESPONSE_WORDS = 70
+MAX_RESPONSE_WORDS = 100
 DEFAULT_SPEECH_RATE_WPM = 185
 
 ENV_API_URL = "KINETIQ_API_URL"
@@ -174,35 +181,83 @@ class ContextManager:
             time.sleep(0.05)
 
 
+def strip_emojis(text: str) -> str:
+    """Remove emojis and normalize unicode characters for clean display and safe console output."""
+    if not text:
+        return ""
+    # Strip emojis and pictographic ranges
+    text = re.sub(
+        r"[\U00010000-\U0010ffff\u2600-\u26ff\u2700-\u27bf\u200d\ufe0f]", "", text
+    )
+    # Normalize smart quotes and dashes to plain ASCII
+    text = (
+        text.replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2014", "-")
+        .replace("\u2013", "-")
+    )
+    return text.strip()
+
+
 class PromptBuilder:
     """Turns a telemetry payload + user question into an LLM-ready prompt."""
 
     SYSTEM_PROMPT = (
-        "You are KINETIQ, a smart, friendly AI wellness mirror assistant (like ChatGPT). "
-        "You give natural, conversational, intelligent responses (2-3 sentences, under 50 words) "
-        "grounded in the user's live physiological and activity metrics, followed by helpful wellness advice. "
-        "Never give medical diagnoses. If signal quality is POOR, state that metrics are unverified. "
-        "GROUNDING CONTRACT: naturally weave in the user's live vitals — mention their activity or exertion, "
-        "and quote their heart rate number next to 'BPM' or 'heart rate is X'. "
-        "For summary or greeting questions ('how am I doing', 'hello', 'what should I do'), also mention steps. "
-        "Always provide a helpful, practical wellness or posture tip (stretching, hydration, walking, or resting)."
+        "You are KINETIQ, an intelligent, empathetic AI wellness mirror assistant. "
+        "Your priority is to directly, accurately, and helpfully answer the user's specific health, fitness, or wellness question. "
+        "Ground and personalize your advice around their live vitals (heart rate BPM, activity, exertion, steps) as context. "
+        "Do not repeatedly give generic stretching advice unless asked. "
+        "Never provide formal medical diagnoses or prescriptions. If signal quality is POOR, state that metrics are unverified estimates. "
+        "Keep responses natural, conversational, and concise (under 85 words, 2-4 sentences). "
+        "Do not use any emojis or emoticons in your responses; use plain text only."
     )
+
+    def _format_instruction(self, payload: Dict[str, Any], query: str) -> str:
+        q_lower = query.lower()
+        is_summary = any(
+            w in q_lower
+            for w in (
+                "how am i doing",
+                "summarize",
+                "summary",
+                "hello",
+                "hi",
+                "greeting",
+                "status",
+                "update",
+                "what should i do",
+            )
+        )
+        poor_note = (
+            " Signal quality is poor, so state that metrics are unverified estimates."
+            if payload.get("ppg_quality") == "poor"
+            else ""
+        )
+        if is_summary or not query:
+            return (
+                f"Directly summarize the user's current wellness state. Mention their current activity ('{payload['activity']}'), "
+                f"exertion ('{payload['exertion']}'), heart rate ('{payload['heart_rate']} BPM'), and steps ('{payload['steps']} steps'), "
+                f"followed by an encouraging wellness tip. Do not use emojis.{poor_note}"
+            )
+        return (
+            f"First and foremost, directly and thoughtfully answer what the user asked: \"{query}\". "
+            f"Then connect your explanation to their live physiological context (current heart rate '{payload['heart_rate']} BPM', "
+            f"'{payload['activity']}' at '{payload['exertion']}' exertion, and '{payload['steps']} steps') where relevant. "
+            f"Provide insightful health guidance rather than generic canned stretching advice. Do not use emojis.{poor_note}"
+        )
 
     def build(self, payload: Dict[str, Any], user_query: str) -> List[Dict[str, str]]:
         """Build an OpenAI-style chat message list."""
         _validate_payload(payload)
         query = (user_query or "").strip()
         body = json.dumps(payload, indent=2)
+        instruction = self._format_instruction(payload, query)
         content = (
             f"User: {query}\n\n"
-            "Live KINETIQ Telemetry (wellness estimates only):\n"
-            "```json\n"
-            f"{body}\n"
-            "```\n\n"
-            "Answer conversationally and smartly like ChatGPT. State their current vitals naturally (mention "
-            f"'{payload['activity']}' or '{payload['exertion']}', 'heart rate is {payload['heart_rate']}' or '{payload['heart_rate']} BPM', "
-            f"and '{payload['steps']} steps' when relevant) and give a helpful health, posture, or wellness suggestion. "
-            "Keep it under 50 words. Do not give medical diagnoses."
+            f"Live Telemetry Context:\n{body}\n\n"
+            f"{instruction}\nKeep it natural and under 85 words. Do not give medical diagnoses."
         )
         return [
             {"role": "system", "content": self.SYSTEM_PROMPT},
@@ -214,12 +269,13 @@ class PromptBuilder:
         _validate_payload(payload)
         query = (user_query or "").strip()
         body = json.dumps(payload, indent=2)
+        instruction = self._format_instruction(payload, query)
         return (
             f"<start_of_turn>system\n{self.SYSTEM_PROMPT}<end_of_turn>\n"
             f"<start_of_turn>user\n"
             f"User: {query}\n\n"
-            f"Live Telemetry:\n{body}\n\n"
-            f"Respond conversationally and smartly like ChatGPT in 2-3 sentences (under 50 words). Include their current state ('{payload['activity']}' or '{payload['exertion']}', 'heart rate is {payload['heart_rate']}' or '{payload['heart_rate']} BPM', and '{payload['steps']} steps' if summarizing or greeting) and add a practical health or posture suggestion.<end_of_turn>\n"
+            f"Live Telemetry Context:\n{body}\n\n"
+            f"{instruction}<end_of_turn>\n"
             f"<start_of_turn>model\n"
         )
 
@@ -255,14 +311,14 @@ class AIAdvisor:
         reply = self._try_ollama(prompt)
         if reply:
             self.last_backend = "ollama"
-            return reply
+            return strip_emojis(reply)
         errors.append(f"ollama: {self.last_error or 'no reply'}")
 
         if self.api_url:
             reply = self._try_api(messages)
             if reply:
                 self.last_backend = "api"
-                return reply
+                return strip_emojis(reply)
             errors.append(f"api: {self.last_error or 'no reply'}")
         else:
             errors.append(f"api: not configured (set {ENV_API_URL}/{ENV_API_KEY})")
@@ -298,7 +354,7 @@ class AIAdvisor:
             resp = requests.post(
                 self.ollama_url,
                 json={"model": self.model, "prompt": prompt, "stream": False,
-                      "options": {"temperature": 0, "num_predict": 220}},
+                      "options": {"temperature": 0.7, "num_predict": 220}},
                 timeout=self.timeout,
             )
             resp.raise_for_status()

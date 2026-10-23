@@ -20,12 +20,14 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -409,6 +411,62 @@ def _speak_async(text):
                       file=sys.stderr, flush=True)
 
     threading.Thread(target=_run, daemon=True).start()
+
+
+def _patch_windows_socketpair():
+    """Windows Hyper-V/NAT dynamic port collisions can break socketpair(host, 0)."""
+    import socket
+    if getattr(socket, "_kinetiq_patched", False):
+        return
+    orig = getattr(socket, "socketpair", None)
+    def _safe_socketpair(family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0):
+        for port in range(49200, 49950):
+            lsock = socket.socket(family, type, proto)
+            try:
+                lsock.bind(("127.0.0.1", port))
+                lsock.listen(1)
+                csock = socket.socket(family, type, proto)
+                csock.connect(("127.0.0.1", port))
+                ssock, _ = lsock.accept()
+                lsock.close()
+                return (ssock, csock)
+            except Exception:
+                try:
+                    lsock.close()
+                except Exception:
+                    pass
+                continue
+        if orig:
+            return orig(family, type, proto)
+    socket.socketpair = _safe_socketpair
+    socket._kinetiq_patched = True
+
+
+def synthesize_neural_tts(text: str, voice: str = "en-US-JennyNeural") -> Optional[bytes]:
+    """Generate high-definition Microsoft Jenny Neural TTS MP3 audio via edge-tts."""
+    msg = (text or "").strip()
+    if not msg:
+        return None
+    try:
+        _patch_windows_socketpair()
+        import asyncio
+        import edge_tts
+
+        clean = re.sub(r'[*_#`~]', '', msg).strip()
+        if not clean:
+            return None
+
+        async def _produce():
+            comm = edge_tts.Communicate(clean, voice)
+            chunks = []
+            async for chunk in comm.stream():
+                if chunk["type"] == "audio":
+                    chunks.append(chunk["data"])
+            return b"".join(chunks)
+
+        return asyncio.run(_produce())
+    except Exception:
+        return None
 
 
 # ---- freshness derivation: exactly four states, never guessed
@@ -904,10 +962,30 @@ body[data-st="STALE"] .hero{box-shadow:inset 0 0 0 2px rgba(255,176,32,.38)}
   scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.2) transparent;
 }
 .m{
-  margin:0 0 10px;padding:.6em .8em;
-  border:1px solid var(--line);border-radius:3px;background:rgba(255,255,255,.028);
-  overflow-wrap:anywhere;word-break:break-word;
+  margin:0 0 10px;padding:.65em .85em;
+  border:1px solid var(--line);border-radius:6px;background:rgba(255,255,255,.025);
+  overflow-wrap:anywhere;word-break:break-word;display:flex;flex-direction:column;gap:3px;
 }
+.m.user{
+  background:rgba(47,129,247,.08);border-color:rgba(47,129,247,.28);
+  margin-left:24px;
+}
+.m.assistant{
+  background:rgba(255,255,255,.03);border-color:var(--line);
+  margin-right:24px;
+}
+.m.system{
+  background:rgba(56,139,253,.06);border-color:rgba(56,139,253,.22);
+  color:#79c0ff;font-style:italic;font-size:.9em;padding:.4em .7em;
+}
+.m-tag{
+  font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;
+  opacity:.85;margin-bottom:2px;
+}
+.m.user .m-tag{color:#58a6ff}
+.m.assistant .m-tag{color:#3fb950}
+.m-body{line-height:1.45}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:currentColor;margin-right:6px;vertical-align:middle}
 .g{
   font-size:clamp(16px,1.6vh,16px);font-weight:800;letter-spacing:.08em;
   padding:.14em .6em;border-radius:2px;margin-left:.6em;white-space:nowrap;
@@ -959,8 +1037,8 @@ footer{
 <div class="brand"><span class="mark"></span><h1 class="wordmark">KINETIQ</h1><span class="tag">the mirror that sees and answers</span></div>
 <div class="hud">
 <div class="mode-switch" id="modeSwitch" title="Switch active source: Band 6 vs FreeRTOS">
-  <button id="btnModeBand" class="mode-btn active" onclick="setMode('band')">&#9200; Band 6</button>
-  <button id="btnModeRtos" class="mode-btn rtos" onclick="setMode('rtos')">&#9889; FreeRTOS</button>
+  <button id="btnModeBand" class="mode-btn active" onclick="setMode('band')">Band 6</button>
+  <button id="btnModeRtos" class="mode-btn rtos" onclick="setMode('rtos')">FreeRTOS</button>
 </div>
 <span class="chip"><span id="lane" style="display:none">LANE</span><span class="sep" id="laneSep" style="display:none">&middot;</span><span id="src">...</span></span>
 <span class="stpill" id="stChip">OFFLINE</span>
@@ -1002,9 +1080,9 @@ footer{
 </section>
 <section class="col right">
 <div class="zone mirror" id="mirror">
-<div class="head"><span class="eyebrow">The mirror sees you</span><span id="presBadge" class="pres-badge idle">&#9898; No person detected</span></div>
+<div class="head"><span class="eyebrow">The mirror sees you</span><span id="presBadge" class="pres-badge idle"><span class="dot"></span>No person detected</span></div>
 <div class="mirror-row">
-<button id="camBtn" class="btn primary">&#128247; Activate Camera Mirror</button>
+<button id="camBtn" class="btn primary">Activate Camera Mirror</button>
 <video id="camVideo" autoplay playsinline muted style="display:none"></video>
 </div>
 <div class="note" id="camMsg">Click above to start mirror camera presence recognition.</div>
@@ -1013,12 +1091,12 @@ footer{
 <div class="zone chat" id="chat">
 <div class="head"><span class="eyebrow">Ask the mirror</span><span class="note">checked against live data</span></div>
 <button id="chatToggle" class="tbtn" title="Collapse assistant" aria-expanded="true" aria-label="Collapse or expand the assistant">&#9662;</button>
-<div id="msgs"><div class="m">&#129726; I can see your live telemetry &mdash; ask me how you&rsquo;re doing.</div></div>
-<div id="lastReply" title="I can see your live telemetry &mdash; ask me how you're doing.">&#129726; I can see your live telemetry &mdash; ask me how you&rsquo;re doing.</div>
+<div id="msgs"><div class="m assistant"><span class="m-tag">KINETIQ</span><span class="m-body">I can see your live telemetry &mdash; ask me how you&rsquo;re doing.</span></div></div>
+<div id="lastReply" title="I can see your live telemetry &mdash; ask me how you're doing.">I can see your live telemetry &mdash; ask me how you&rsquo;re doing.</div>
 <div id="qin">
 <input id="q" placeholder="How am I doing?" autocomplete="off">
-<button id="mic" class="btn" title="Voice input (mic)">&#127908;</button>
-<button id="spk" class="btn" title="Spoken replies on/off">&#128266;</button>
+<button id="mic" class="btn" title="Voice input (mic)">Mic</button>
+<button id="spk" class="btn primary" title="Spoken replies on/off">Voice On</button>
 <button id="send" class="btn primary">Send</button>
 </div>
 </div>
@@ -1218,7 +1296,7 @@ function speakNaturalFemale(text) {
   if (!window.speechSynthesis || !ttsOn) return;
   try {
     window.speechSynthesis.cancel();
-    var clean = text.replace(/[*_#`~🪞🧑]/g, '').trim();
+    var clean = text.replace(/[*_#`~]/g, '').trim();
     var u = new SpeechSynthesisUtterance(clean);
     var voices = window.speechSynthesis.getVoices();
     var v = voices.find(function(x) {
@@ -1233,6 +1311,19 @@ function speakNaturalFemale(text) {
     window.speechSynthesis.speak(u);
   } catch (e) {
     console.error('Speech synthesis error:', e);
+  }
+}
+function speakAudio(text) {
+  if (!ttsOn || !text) return;
+  var clean = text.replace(/[*_#`~]/g, '').trim();
+  if (!clean) return;
+  try {
+    var audio = new Audio('/api/tts?text=' + encodeURIComponent(clean));
+    audio.play().catch(function (e) {
+      speakNaturalFemale(clean);
+    });
+  } catch (e) {
+    speakNaturalFemale(clean);
   }
 }
 if (window.speechSynthesis) {
@@ -1265,23 +1356,23 @@ function checkPresenceAndGreet() {
   var v = $('camVideo');
   if (!v || !v.videoWidth || !camStream) {
     presenceSeconds = 0;
-    updatePresenceUI('idle', '&#9898; No person detected', 'Click above to activate camera mirror.');
+    updatePresenceUI('idle', '<span class="dot"></span>No person detected', 'Click above to activate camera mirror.');
     return;
   }
 
   if (personInFrame) {
     presenceSeconds++;
     if (presenceSeconds < 5) {
-      updatePresenceUI('detecting', '&#128993; Person in range: ' + presenceSeconds + 's / 5s',
+      updatePresenceUI('detecting', '<span class="dot"></span>Person in range: ' + presenceSeconds + 's / 5s',
                        'Person detected! Hold position in front of mirror (' + presenceSeconds + '/5s to greeting)...');
     } else {
-      updatePresenceUI('active', '&#128994; User Present (' + presenceSeconds + 's)',
+      updatePresenceUI('active', '<span class="dot"></span>User Present (' + presenceSeconds + 's)',
                        'User recognized in mirror range! Health assistant is listening.');
       if (!autoGreetDone && (Date.now() - lastGreetTimestamp > 45000)) {
         autoGreetDone = true;
         lastGreetTimestamp = Date.now();
         var m = $('msgs');
-        m.innerHTML += '<div class="m" style="border-color:var(--accent);color:#79c0ff">&#129726; <em>User detected for 5s &mdash; Spoken greeting activated!</em></div>';
+        m.innerHTML += '<div class="m system">User detected for 5s &mdash; Spoken greeting activated!</div>';
         m.scrollTop = m.scrollHeight;
         sendText("Hello mirror, I just stepped in front of you. Greet me, tell me my live stats, and give me a quick health suggestion.", true);
       }
@@ -1291,7 +1382,7 @@ function checkPresenceAndGreet() {
       presenceSeconds = Math.max(0, presenceSeconds - 2);
     }
     if (presenceSeconds === 0) {
-      updatePresenceUI('idle', '&#9898; No person detected', 'Mirror idle &mdash; Step into camera range to activate.');
+      updatePresenceUI('idle', '<span class="dot"></span>No person detected', 'Mirror idle &mdash; Step into camera range to activate.');
       if (autoGreetDone && (Date.now() - lastGreetTimestamp > 10000)) {
         autoGreetDone = false; // Reset so next visitor gets greeted
       }
@@ -1311,8 +1402,8 @@ function camStop(silent) {
   v.removeAttribute('srcObject');
   v.srcObject = null;
   v.style.display = 'none';
-  $('camBtn').textContent = '📷 Activate Camera Mirror';
-  updatePresenceUI('idle', '&#9898; No person detected', 'Click above to activate camera mirror.');
+  $('camBtn').textContent = 'Activate Camera Mirror';
+  updatePresenceUI('idle', '<span class="dot"></span>No person detected', 'Click above to activate camera mirror.');
 }
 
 function camFrame() {
@@ -1383,8 +1474,8 @@ $('camBtn').onclick = function () {
     var v = $('camVideo');
     v.srcObject = stream;
     v.style.display = 'block';
-    btn.textContent = '⏹ Stop Camera';
-    updatePresenceUI('idle', '&#9898; Scanning...', 'Camera live — stand in front of mirror.');
+    btn.textContent = 'Stop Camera';
+    updatePresenceUI('idle', '<span class="dot"></span>Scanning...', 'Camera live — stand in front of mirror.');
     camSenseTimer = setInterval(camFrame, 250);
     camPostTimer = setInterval(camPost, 1000);
   }).catch(function () {
@@ -1401,7 +1492,8 @@ function sendText(q, isAuto) {
   if (!q) { return; }
   var m = $('msgs');
   if (!isAuto) {
-    m.innerHTML += '<div class="m">&#129489; ' + q.replace(/</g, '&lt;') + '</div>';
+    m.innerHTML += '<div class="m user"><span class="m-tag">YOU</span><span class="m-body">' + q.replace(/</g, '&lt;') + '</span></div>';
+    m.scrollTop = m.scrollHeight;
   }
   var useBackendTTS = !('speechSynthesis' in window) && ttsOn;
   fetch('/api/ask', {
@@ -1411,15 +1503,15 @@ function sendText(q, isAuto) {
   }).then(function (r) { return r.json(); }).then(function (d) {
     var g = d.grounding || 'FAIL', cls = g === 'PASS' ? 'pass' : 'fail';
     var reply = (d.answer || d.error || '?');
-    m.innerHTML += '<div class="m">&#129726; ' + (reply.replace(/</g, '&lt;'))
+    m.innerHTML += '<div class="m assistant"><span class="m-tag">KINETIQ</span><span class="m-body">' + (reply.replace(/</g, '&lt;'))
       + '<span class="g ' + cls + '">' + g + '</span>'
-      + '<span class="age" style="display:inline;margin-left:8px">' + freshLabel + '</span></div>';
+      + '<span class="age" style="display:inline;margin-left:8px">' + freshLabel + '</span></span></div>';
     m.scrollTop = m.scrollHeight;
     var lr = $('lastReply');
-    lr.textContent = '🪞 ' + reply;
+    lr.textContent = reply;
     lr.title = reply;
-    if (ttsOn && d.answer && ('speechSynthesis' in window)) {
-      speakNaturalFemale(d.answer);
+    if (ttsOn && d.answer) {
+      speakAudio(d.answer);
     }
   });
 }
@@ -1437,10 +1529,14 @@ function setChat(open) {
   if (open) { var m = $('msgs'); m.scrollTop = m.scrollHeight; }
 }
 $('chatToggle').onclick = function () { setChat(!chatOpen); };
-$('spk').onclick = function () { ttsOn = !ttsOn; this.textContent = ttsOn ? '🔊' : '🔇'; };
+$('spk').onclick = function () {
+  ttsOn = !ttsOn;
+  this.textContent = ttsOn ? 'Voice On' : 'Voice Muted';
+  this.classList.toggle('primary', ttsOn);
+};
 function micHint(t) {
   var m = $('msgs');
-  m.innerHTML += '<div class="m">🎤 ' + t + ' — type instead, text chat keeps working.</div>';
+  m.innerHTML += '<div class="m system">' + t + ' &mdash; type instead, text chat keeps working.</div>';
   m.scrollTop = m.scrollHeight;
 }
 function stopMic() {
@@ -1448,7 +1544,7 @@ function stopMic() {
   if (recorder && recorder.state !== 'inactive') { try { recorder.stop(); } catch (e) {} }
   var b = $('mic');
   b.classList.remove('rec');
-  b.textContent = '🎤';
+  b.textContent = 'Mic';
 }
 $('mic').onclick = function () {
   if (recorder && recorder.state !== 'inactive') { stopMic(); return; }
@@ -1466,25 +1562,30 @@ $('mic').onclick = function () {
       stream.getTracks().forEach(function (t) { t.stop(); });
       if (!chunks.length) { micHint('heard nothing, try again'); return; }
       var blob = new Blob(chunks, { type: 'audio/webm' }), m = $('msgs');
-      m.innerHTML += '<div class="m">🎤 transcribing…</div>';
+      var statusId = 'status_' + Date.now();
+      m.innerHTML += '<div class="m system" id="' + statusId + '">Transcribing voice input\u2026</div>';
       m.scrollTop = m.scrollHeight;
       fetch('/api/transcribe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: blob
       }).then(function (r) { return r.json(); }).then(function (d) {
+        var statusEl = $(statusId);
+        if (statusEl) { statusEl.remove(); }
         if (d.text) {
-          m.innerHTML += '<div class="m">🧑 🎤 ' + d.text.replace(/</g, '&lt;') + '</div>';
           sendText(d.text);
         } else {
           micHint('could not hear that (' + (d.error || '?') + ')');
         }
-        m.scrollTop = m.scrollHeight;
-      }).catch(function () { micHint('transcription failed'); });
+      }).catch(function () {
+        var statusEl = $(statusId);
+        if (statusEl) { statusEl.remove(); }
+        micHint('transcription failed');
+      });
     };
     recorder.start();
     btn.classList.add('rec');
-    btn.textContent = '⏹';
+    btn.textContent = 'Listening...';
     recTimer = setTimeout(stopMic, 10000);
   }).catch(function () { micHint('mic blocked — allow microphone permission, or type instead'); });
 };
@@ -1527,6 +1628,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(body), "application/json")
         elif self.path.split("?")[0] == "/api/mode":
             self._send(200, json.dumps({"mode": _ACTIVE_MODE, "lane": _current_lane_label(), "locked": STDIN_MODE}), "application/json")
+        elif self.path.split("?")[0] == "/api/tts":
+            query_str = self.path.split("?", 1)[1] if "?" in self.path else ""
+            import urllib.parse
+            params = urllib.parse.parse_qs(query_str)
+            text = params.get("text", [""])[0]
+            if not text:
+                self._send(400, '{"error":"missing text"}', "application/json")
+                return
+            audio_data = synthesize_neural_tts(text)
+            if audio_data:
+                self._send(200, audio_data, "audio/mpeg")
+            else:
+                self._send(503, '{"error":"neural tts unavailable"}', "application/json")
         elif self.path.split("?")[0] in ("/", "/index.html"):
             self._send(200, PAGE, "text/html; charset=utf-8")
         else:
