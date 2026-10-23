@@ -362,6 +362,13 @@ class TTSOutput:
             import pyttsx3  # lazy: never required for import or console output
 
             self._engine = pyttsx3.init()
+            try:
+                for v in self._engine.getProperty("voices"):
+                    if "zira" in v.name.lower() or "female" in str(getattr(v, "gender", "")).lower():
+                        self._engine.setProperty("voice", v.id)
+                        break
+            except Exception:
+                pass
         except Exception as exc:  # missing package, no audio device, COM error
             self._engine = None
             self.fallback_reason = f"{type(exc).__name__}: {exc}"

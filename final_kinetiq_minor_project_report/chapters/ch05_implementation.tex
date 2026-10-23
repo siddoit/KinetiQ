@@ -1,7 +1,9 @@
 \chapter{IMPLEMENTATION AND METHODOLOGY}
 
 \section{Software Organisation}
-The implementation is organised as cooperating, deliberately narrow modules. The native FreeRTOS source at \code{hardware/native/}\allowbreak\code{kinetiq\_tasks.c} produces synthetic control messages and diagnostics. The Python receiver package contains the shared schema, BLE mock, bridge-related helpers, and local data handling. The web application at \code{laptop/web/}\allowbreak\code{app.py} owns dashboard state and exposes local endpoints. The AI and voice modules reside under \code{laptop/ai}. This separation keeps a transport adapter from becoming an unexamined source of truth for the UI.
+The implementation is organised as cooperating, deliberately narrow modules. The native FreeRTOS source at \code{hardware/native/}\allowbreak\code{kinetiq\_tasks.c} produces synthetic control messages and diagnostics. The Python receiver package contains the shared schema, BLE mock, bridge-related helpers, and local data handling.
+
+The web application at \code{laptop/web/}\allowbreak\code{app.py} owns dashboard state and exposes local endpoints. The AI and voice modules reside under \code{laptop/ai}. This separation keeps a transport adapter from becoming an unexamined source of truth for the UI.
 
 \begin{table}[H]
 \centering
@@ -75,7 +77,9 @@ emit_to_mirror({timestamp, heart_rate, spo2, activity="unknown",
 The PPG-quality assignment is an upstream-completion proxy, not a signal-quality algorithm. The exertion field is a bridge heuristic. The reporting language therefore treats the bridge output as validated transport context with selected derived fields, not as a fully measured physiological model.
 
 \section{Schema Validation and Dashboard State}
-The web ingress parses JSON, validates the eight required keys, and ignores non-JSON standard-input lines. The validator restricts activity to \code{rest}, \code{walk}, \code{run}, \code{active}, or \code{unknown}; exertion to \code{rest}, \code{light}, \code{moderate}, or \code{high}; and PPG quality to \code{good} or \code{poor}. Numeric boundaries are listed in Table~\ref{tab:telemetry-contract}. Rejected packets do not replace the accepted wellness snapshot.
+The web ingress parses JSON, validates the eight required keys, and ignores non-JSON standard-input lines.
+
+The validator restricts activity to \code{rest}, \code{walk}, \code{run}, \code{active}, or \code{unknown}; exertion to \code{rest}, \code{light}, \code{moderate}, or \code{high}; and PPG quality to \code{good} or \code{poor}. Numeric boundaries are listed in Table~\ref{tab:telemetry-contract}. Rejected packets do not replace the accepted wellness snapshot.
 
 Freshness is implemented in the web layer with a 60 s live interval, a subsequent 60 s stale interval, and an offline limit at 300 s. The code additionally detects whether a newly arriving packet changed the snapshot fingerprint. This distinguishes a recently arriving repeated value (\texttt{UNCHANGED}) from a value that has stopped arriving (\texttt{STALE} or \texttt{OFFLINE}). The value display is blanked in the offline condition.
 

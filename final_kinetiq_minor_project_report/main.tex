@@ -24,6 +24,10 @@
 \usepackage{csquotes}
 \usepackage[backend=biber,style=numeric,sorting=none,maxbibnames=99]{biblatex}
 \addbibresource{references.bib}
+% Allow line breaks inside bibliography URLs (avoids overfull bibliography lines)
+\setcounter{biburlnumpenalty}{100}
+\setcounter{biburlucpenalty}{100}
+\setcounter{biburllcpenalty}{100}
 \usepackage[colorlinks=true,linkcolor=black,citecolor=black,urlcolor=blue!60!black,pdfauthor={Sidharth Sajith and Tharun Oommen Jacob},pdftitle={KINETIQ -- Real-Time Wellness Mirror with FreeRTOS and Sensor-Grounded AI}]{hyperref}
 
 \definecolor{kinetiqBlue}{HTML}{173B61}

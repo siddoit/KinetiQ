@@ -391,7 +391,11 @@ def _speak_async(text):
 
                 eng = pyttsx3.init()
                 try:
-                    eng.setProperty("rate", 175)
+                    for v in eng.getProperty("voices"):
+                        if "zira" in v.name.lower() or "female" in str(getattr(v, "gender", "")).lower():
+                            eng.setProperty("voice", v.id)
+                            break
+                    eng.setProperty("rate", 165)
                 except Exception:
                     pass
                 eng.say(msg[:600])
@@ -540,9 +544,8 @@ def _band_collector_loop():
             )
             with urllib.request.urlopen(req, timeout=1.8) as resp:
                 snap = json.loads(resp.read().decode("utf-8"))
-            freshness = snap.get("real_freshness") or "offline"
             real = snap.get("real")
-            if freshness == "live" and isinstance(real, dict) and real.get("simulated") is False:
+            if isinstance(real, dict) and real.get("simulated") is False:
                 hr = real.get("heart_rate_bpm")
                 spo2 = real.get("spo2_percent")
                 steps = real.get("steps", 0)
@@ -878,9 +881,13 @@ body[data-st="STALE"] .hero{box-shadow:inset 0 0 0 2px rgba(255,176,32,.38)}
 .btn:hover{background:rgba(255,255,255,.07)}
 .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
 .btn.primary:hover{background:#4a92ff;border-color:#4a92ff}
-#camVideo{width:min(40%,200px);display:block;background:#000}
+#camVideo{width:min(40%,200px);display:block;background:#000;border-radius:4px;border:1px solid var(--line-2)}
 #camCanvas{display:none}
-#camMsg{min-height:1.4em}
+#camMsg{min-height:1.4em;transition:color .2s ease}
+.pres-badge{display:inline-flex;align-items:center;padding:2px 8px;font-size:11px;font-weight:700;letter-spacing:.04em;border-radius:4px;text-transform:uppercase}
+.pres-badge.idle{background:rgba(110,118,129,.15);color:#8b949e;border:1px solid #30363d}
+.pres-badge.detecting{background:rgba(210,153,34,.2);color:#e3b341;border:1px solid #d29922}
+.pres-badge.active{background:rgba(46,160,67,.2);color:#3fb950;border:1px solid #2ea043}
 .chat{gap:10px}
 .tbtn{
   font:inherit;font-size:clamp(16px,1.6vh,16px);font-weight:700;line-height:1;
@@ -995,12 +1002,12 @@ footer{
 </section>
 <section class="col right">
 <div class="zone mirror" id="mirror">
-<div class="head"><span class="eyebrow">The mirror sees you</span><span class="note">on-device only</span></div>
+<div class="head"><span class="eyebrow">The mirror sees you</span><span id="presBadge" class="pres-badge idle">&#9898; No person detected</span></div>
 <div class="mirror-row">
-<button id="camBtn" class="btn primary">&#128247; Use camera as my sensor</button>
+<button id="camBtn" class="btn primary">&#128247; Activate Camera Mirror</button>
 <video id="camVideo" autoplay playsinline muted style="display:none"></video>
 </div>
-<div class="note" id="camMsg">Click to activate camera mirror &mdash; detects your presence and greets you automatically!</div>
+<div class="note" id="camMsg">Click above to start mirror camera presence recognition.</div>
 <canvas id="camCanvas" width="64" height="48" style="display:none"></canvas>
 </div>
 <div class="zone chat" id="chat">
@@ -1149,10 +1156,10 @@ function tick() {
     s.className = (d.source === 'CAMERA' ? 'cam' : '');
     $('up').textContent = 'uptime ' + fmtUptime(d.uptime_s);
     $('rej').textContent = 'rejected frames ' + (d.rejects === undefined ? '--' : d.rejects);
-    /* STALE is still data: only OFFLINE blanks and dims the numbers. */
+    /* STALE is still data: only OFFLINE dims the numbers. */
     $('vals').classList.toggle('dim', st === 'OFFLINE');
     $('vals2').classList.toggle('dim', st === 'OFFLINE');
-    if (!L || st === 'OFFLINE') { blank(); return; }
+    if (!L) { blank(); return; }
     var a = String(L.activity || '--').toUpperCase(), el = $('activity');
     el.textContent = a;
     el.className = 'act ' + (a === 'REST' ? 'rest' : (a === 'WALK' ? 'walk' : (a === 'RUN' ? 'run' : '')));
@@ -1206,34 +1213,89 @@ function updateModeUI(m, locked) {
   }
 }
 
-/* ---- camera as sensor: getUserMedia motion -> POST /api/camera_ingest */
+/* ---- natural female speech synthesis (Jenny / Aria / Zira) ---- */
+function speakNaturalFemale(text) {
+  if (!window.speechSynthesis || !ttsOn) return;
+  try {
+    window.speechSynthesis.cancel();
+    var clean = text.replace(/[*_#`~🪞🧑]/g, '').trim();
+    var u = new SpeechSynthesisUtterance(clean);
+    var voices = window.speechSynthesis.getVoices();
+    var v = voices.find(function(x) {
+      var n = x.name.toLowerCase();
+      return (n.includes('natural') || n.includes('jenny') || n.includes('aria') || n.includes('zira') || n.includes('female')) && x.lang.startsWith('en');
+    }) || voices.find(function(x) {
+      return x.lang.startsWith('en') && !x.name.toLowerCase().includes('david') && !x.name.toLowerCase().includes('george') && !x.name.toLowerCase().includes('male');
+    });
+    if (v) { u.voice = v; }
+    u.rate = 1.0;
+    u.pitch = 1.05;
+    window.speechSynthesis.speak(u);
+  } catch (e) {
+    console.error('Speech synthesis error:', e);
+  }
+}
+if (window.speechSynthesis) {
+  window.speechSynthesis.onvoiceschanged = function() {
+    window.speechSynthesis.getVoices();
+  };
+}
+
+/* ---- smart camera presence detection & greeting ---- */
 var camStream = null, camPrev = null, camEMA = 0, camSenseTimer = null, camPostTimer = null;
 var presenceSeconds = 0, autoGreetDone = false, lastGreetTimestamp = 0;
+var faceDetector = null, lastHasFace = false, personInFrame = false;
+
+if ('FaceDetector' in window) {
+  try { faceDetector = new FaceDetector({ fastMode: true, maxDetectedFaces: 1 }); } catch (e) {}
+}
+
+function updatePresenceUI(state, text, msg) {
+  var b = $('presBadge');
+  if (b) {
+    b.className = 'pres-badge ' + state;
+    b.innerHTML = text;
+  }
+  if (msg) {
+    $('camMsg').textContent = msg;
+  }
+}
 
 function checkPresenceAndGreet() {
   var v = $('camVideo');
   if (!v || !v.videoWidth || !camStream) {
     presenceSeconds = 0;
+    updatePresenceUI('idle', '&#9898; No person detected', 'Click above to activate camera mirror.');
     return;
   }
-  if (camEMA >= 0.001) {
+
+  if (personInFrame) {
     presenceSeconds++;
-    $('camMsg').textContent = 'Camera live: Person detected (' + presenceSeconds + 's) — wave to move mirror.';
+    if (presenceSeconds < 5) {
+      updatePresenceUI('detecting', '&#128993; Person in range: ' + presenceSeconds + 's / 5s',
+                       'Person detected! Hold position in front of mirror (' + presenceSeconds + '/5s to greeting)...');
+    } else {
+      updatePresenceUI('active', '&#128994; User Present (' + presenceSeconds + 's)',
+                       'User recognized in mirror range! Health assistant is listening.');
+      if (!autoGreetDone && (Date.now() - lastGreetTimestamp > 45000)) {
+        autoGreetDone = true;
+        lastGreetTimestamp = Date.now();
+        var m = $('msgs');
+        m.innerHTML += '<div class="m" style="border-color:var(--accent);color:#79c0ff">&#129726; <em>User detected for 5s &mdash; Spoken greeting activated!</em></div>';
+        m.scrollTop = m.scrollHeight;
+        sendText("Hello mirror, I just stepped in front of you. Greet me, tell me my live stats, and give me a quick health suggestion.", true);
+      }
+    }
   } else {
-    if (presenceSeconds > 0) presenceSeconds--;
-  }
-
-  if (presenceSeconds >= 5 && !autoGreetDone && (Date.now() - lastGreetTimestamp > 60000)) {
-    autoGreetDone = true;
-    lastGreetTimestamp = Date.now();
-    var m = $('msgs');
-    m.innerHTML += '<div class="m" style="border-color:var(--accent);color:#79c0ff">🪞 <em>Person detected in mirror range for 5s — Greeting activated!</em></div>';
-    m.scrollTop = m.scrollHeight;
-    sendText("Hello mirror, I just stepped in front of you. Greet me, tell me my live stats, and give me a health suggestion.", true);
-  }
-
-  if (presenceSeconds <= 0 && autoGreetDone && (Date.now() - lastGreetTimestamp > 15000)) {
-    autoGreetDone = false;
+    if (presenceSeconds > 0) {
+      presenceSeconds = Math.max(0, presenceSeconds - 2);
+    }
+    if (presenceSeconds === 0) {
+      updatePresenceUI('idle', '&#9898; No person detected', 'Mirror idle &mdash; Step into camera range to activate.');
+      if (autoGreetDone && (Date.now() - lastGreetTimestamp > 10000)) {
+        autoGreetDone = false; // Reset so next visitor gets greeted
+      }
+    }
   }
 }
 
@@ -1244,28 +1306,59 @@ function camStop(silent) {
   camPrev = null;
   presenceSeconds = 0;
   autoGreetDone = false;
+  personInFrame = false;
   var v = $('camVideo');
   v.removeAttribute('srcObject');
   v.srcObject = null;
   v.style.display = 'none';
-  $('camBtn').textContent = '📷 Use camera as my sensor';
-  if (!silent) { $('camMsg').textContent = 'Click to activate camera mirror — detects your presence and greets you automatically!'; }
+  $('camBtn').textContent = '📷 Activate Camera Mirror';
+  updatePresenceUI('idle', '&#9898; No person detected', 'Click above to activate camera mirror.');
 }
+
 function camFrame() {
   var v = $('camVideo');
-  if (!v.videoWidth) { return; }
+  if (!v || !v.videoWidth) { return; }
+
+  // 1. Check native face detection if supported by browser
+  if (faceDetector) {
+    faceDetector.detect(v).then(function (faces) {
+      lastHasFace = faces.length > 0;
+    }).catch(function () {});
+  }
+
+  // 2. Downsampled 64x48 canvas for central mirror-zone presence & motion
   var c = $('camCanvas'), x = c.getContext('2d');
   x.drawImage(v, 0, 0, 64, 48);
   var d = x.getImageData(0, 0, 64, 48).data, g = [], i;
   for (i = 0; i < d.length; i += 4) { g.push((d[i] + d[i + 1] + d[i + 2]) / 3); }
+
   if (camPrev) {
-    var s = 0;
-    for (i = 0; i < g.length; i++) { s += Math.abs(g[i] - camPrev[i]); }
-    var raw = (s / g.length) / 255;
-    camEMA = camEMA + 0.25 * (raw - camEMA);
+    var totalDiff = 0, centerDiff = 0, centerCount = 0;
+    for (var y = 0; y < 48; y++) {
+      for (var col = 0; col < 64; col++) {
+        var idx = y * 64 + col;
+        var diff = Math.abs(g[idx] - camPrev[idx]);
+        totalDiff += diff;
+        // Central 50% region (mirror presence zone: y: 10..38, col: 14..50)
+        if (y >= 10 && y <= 38 && col >= 14 && col <= 50) {
+          centerDiff += diff;
+          centerCount++;
+        }
+      }
+    }
+    var raw = (totalDiff / g.length) / 255.0;
+    var centerRaw = (centerDiff / (centerCount || 1)) / 255.0;
+    camEMA = camEMA + 0.3 * (raw - camEMA);
+
+    // Person is present if:
+    // a) Face detected by Chromium API, OR
+    // b) Center motion is above the noise floor (human breathing/micro-motion > 0.010), OR
+    // c) Overall motion is active (> 0.014)
+    personInFrame = lastHasFace || (centerRaw >= 0.010) || (raw >= 0.014);
   }
   camPrev = g;
 }
+
 function camPost() {
   fetch('/api/camera_ingest', {
     method: 'POST',
@@ -1274,6 +1367,7 @@ function camPost() {
   }).catch(function () {});
   checkPresenceAndGreet();
 }
+
 $('camBtn').onclick = function () {
   if (camStream) { camStop(); return; }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -1285,15 +1379,16 @@ $('camBtn').onclick = function () {
     camStream = stream;
     camEMA = 0;
     camPrev = null;
+    presenceSeconds = 0;
     var v = $('camVideo');
     v.srcObject = stream;
     v.style.display = 'block';
-    btn.textContent = '⏹ Stop camera';
-    $('camMsg').textContent = 'Camera live — wave to move the mirror.';
+    btn.textContent = '⏹ Stop Camera';
+    updatePresenceUI('idle', '&#9898; Scanning...', 'Camera live — stand in front of mirror.');
     camSenseTimer = setInterval(camFrame, 250);
     camPostTimer = setInterval(camPost, 1000);
   }).catch(function () {
-    $('camMsg').textContent = 'Camera blocked — allow camera permission, or stay on mock engine.';
+    $('camMsg').textContent = 'Camera blocked — allow camera permission in browser.';
   });
 };
 
@@ -1306,23 +1401,26 @@ function sendText(q, isAuto) {
   if (!q) { return; }
   var m = $('msgs');
   if (!isAuto) {
-    m.innerHTML += '<div class="m">🧑 ' + q.replace(/</g, '&lt;') + '</div>';
+    m.innerHTML += '<div class="m">&#129489; ' + q.replace(/</g, '&lt;') + '</div>';
   }
+  var useBackendTTS = !('speechSynthesis' in window) && ttsOn;
   fetch('/api/ask', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ q: q, tts: ttsOn })
+    body: JSON.stringify({ q: q, tts: useBackendTTS })
   }).then(function (r) { return r.json(); }).then(function (d) {
     var g = d.grounding || 'FAIL', cls = g === 'PASS' ? 'pass' : 'fail';
     var reply = (d.answer || d.error || '?');
-    m.innerHTML += '<div class="m">🪞 ' + (reply.replace(/</g, '&lt;'))
+    m.innerHTML += '<div class="m">&#129726; ' + (reply.replace(/</g, '&lt;'))
       + '<span class="g ' + cls + '">' + g + '</span>'
       + '<span class="age" style="display:inline;margin-left:8px">' + freshLabel + '</span></div>';
     m.scrollTop = m.scrollHeight;
-    /* collapsed bar shows the last reply at all times */
     var lr = $('lastReply');
     lr.textContent = '🪞 ' + reply;
     lr.title = reply;
+    if (ttsOn && d.answer && ('speechSynthesis' in window)) {
+      speakNaturalFemale(d.answer);
+    }
   });
 }
 /* collapse toggle: collapsed = slim ~56px bar (last reply + input),
