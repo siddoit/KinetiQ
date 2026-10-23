@@ -26,6 +26,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -38,10 +39,11 @@ if _AI_DIR not in sys.path:
     sys.path.append(_AI_DIR)
 
 try:
-    from mock_streamer import StreamerState, build_packet
+    from mock_streamer import StreamerState, build_packet, derive_exertion
 except ImportError:
     StreamerState = None  # type: ignore
     build_packet = None  # type: ignore
+    derive_exertion = None  # type: ignore
 
 try:
     from telemetry_schema import TelemetryRecord
@@ -521,56 +523,70 @@ def _store(packet_dict):
 
 
 def _band_collector_loop():
-    """Direct background collector for genuine Huawei Band 6 biometrics."""
+    """Direct background collector for genuine Huawei Band 6 biometrics.
+
+    Runs only when _ACTIVE_MODE == 'band' AND standard input is not active
+    (not STDIN_MODE). If STDIN_MODE is True (e.g. band_bridge.py | app.py --stdin),
+    _stdin_loop is the sole collector to prevent double-stamping and fingerprint thrash.
+    """
     while True:
-        if _ACTIVE_MODE == "band":
-            try:
-                req = urllib.request.Request(
-                    "http://127.0.0.1:8000/api/wearable/latest",
-                    headers={"Accept": "application/json"}
-                )
-                with urllib.request.urlopen(req, timeout=1.8) as resp:
-                    snap = json.loads(resp.read().decode("utf-8"))
-                real = snap.get("real")
-                if isinstance(real, dict) and real.get("simulated") is False:
-                    hr = real.get("heart_rate_bpm")
-                    spo2 = real.get("spo2_percent")
-                    steps = real.get("steps", 0)
-                    if hr is not None and spo2 is not None:
-                        now = time.monotonic()
-                        if _cam_fresh(now):
-                            with _lock:
-                                m = float(_cam.get("motion", 0.0))
-                            band = _cam_band_update(m, now)
-                            activity = band if band in ("rest", "walk", "run") else "rest"
-                            intensity = min(1.0, max(0.0, m))
-                        else:
-                            activity = "rest"
-                            intensity = 0.0
+        if _ACTIVE_MODE != "band" or STDIN_MODE:
+            time.sleep(0.5)
+            continue
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:8000/api/wearable/latest",
+                headers={"Accept": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=1.8) as resp:
+                snap = json.loads(resp.read().decode("utf-8"))
+            freshness = snap.get("real_freshness") or "offline"
+            real = snap.get("real")
+            if freshness == "live" and isinstance(real, dict) and real.get("simulated") is False:
+                hr = real.get("heart_rate_bpm")
+                spo2 = real.get("spo2_percent")
+                steps = real.get("steps", 0)
+                if hr is not None and spo2 is not None:
+                    ts_val = int(time.time())
+                    raw_ts = real.get("timestamp")
+                    if raw_ts:
+                        try:
+                            val = str(raw_ts).strip()
+                            if val.endswith(("Z", "z")):
+                                val = val[:-1] + "+00:00"
+                            dt = datetime.fromisoformat(val)
+                            ts_val = int(dt.timestamp())
+                        except Exception:
+                            pass
+                    if ts_val <= 0:
+                        ts_val = int(time.time())
 
-                        exertion = "rest"
-                        if hr >= 130:
-                            exertion = "high"
-                        elif hr >= 100:
-                            exertion = "moderate"
-                        elif hr >= 80:
-                            exertion = "light"
+                    hr_int = int(hr)
+                    spo2_int = int(round(float(spo2)))
+                    steps_int = int(steps or 0)
+                    if derive_exertion:
+                        exert = derive_exertion(hr_int, "unknown")
+                    else:
+                        exert = "rest" if hr_int < 80 else ("light" if hr_int < 100 else ("moderate" if hr_int < 130 else "high"))
 
-                        pkt = {
-                            "timestamp": int(time.time()),
-                            "heart_rate": int(hr),
-                            "spo2": int(round(float(spo2))),
-                            "activity": activity,
-                            "motion_intensity": round(intensity, 2),
-                            "exertion": exertion,
-                            "steps": int(steps or 0),
-                            "ppg_quality": "good",
-                        }
-                        if TelemetryRecord:
-                            rec = TelemetryRecord.parse(pkt)
-                            _store(rec.to_dict())
-            except Exception:
-                pass
+                    # Honest Band 6 contract (matches band_bridge.py):
+                    # Activity and motion are not relayed by hardware -> marked honest placeholders.
+                    # This prevents camera jitter from thrashing the freshness fingerprint.
+                    pkt = {
+                        "timestamp": ts_val,
+                        "heart_rate": hr_int,
+                        "spo2": spo2_int,
+                        "activity": "unknown",
+                        "motion_intensity": 0.0,
+                        "exertion": exert,
+                        "steps": steps_int,
+                        "ppg_quality": "good",
+                    }
+                    if TelemetryRecord:
+                        rec = TelemetryRecord.parse(pkt)
+                        _store(rec.to_dict())
+        except Exception:
+            pass
         time.sleep(1.0)
 
 
