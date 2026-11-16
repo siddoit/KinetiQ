@@ -1,48 +1,66 @@
 \chapter{SYSTEM DESIGN AND ARCHITECTURE}
 
 \section{Three-Tier Architecture}
-KINETIQ has a sensing/control tier, a local transport and validation tier, and a laptop application tier. The first tier is deliberately dual: the Huawei route carries genuine wearable-path observations, while the native FreeRTOS route generates labelled synthetic control telemetry. The transport tier authenticates or validates input and translates eligible values to the shared contract. The application tier renders state, accepts voice or text requests, and conditions the assistant on the accepted telemetry context.
+The developed wellness mirror system, implemented as the KINETIQ application, incorporates a sensing/control tier, a local transport and validation tier, and a laptop application tier. The first tier is deliberately dual: the Huawei route carries genuine wearable-path observations, while the native FreeRTOS route generates labelled synthetic control telemetry. The transport tier authenticates or validates input and translates eligible values to the shared contract. The application tier renders state, accepts voice or text requests, and conditions the assistant on the accepted telemetry context.
 
 \begin{figure}[H]
 \centering
-\begin{tikzpicture}[font=\footnotesize, node distance=5mm and 5mm, >=Latex,
- lane/.style={draw,rounded corners=2mm,align=center,minimum height=11mm,text width=23mm},
- genuine/.style={lane,draw=kinetiqGreen,fill=softGreen},
- synth/.style={lane,draw=kinetiqOrange,fill=softOrange},
- common/.style={lane,draw=kinetiqBlue,fill=softBlue},
- label/.style={align=right,text width=23mm,font=\scriptsize\bfseries},
- flow/.style={->,thick,draw=kinetiqBlue}]
-\node[label,text=kinetiqGreen] (glabel) {GENUINE\\WEARABLE PATHWAY};
-\node[genuine,right=of glabel] (band) {Huawei Band 6};
-\node[genuine,right=of band] (health) {Huawei Health\\visible UI state};
-\node[genuine,right=of health] (access) {Android accessibility\\streaming service};
-\node[genuine,right=of access] (post) {Authenticated local\\POST receiver};
-\draw[flow] (band)--(health);
-\draw[flow] (health)--(access);
-\draw[flow] (access)--(post);
+\resizebox{0.98\textwidth}{!}{%
+\begin{tikzpicture}[font=\small, >=Latex,
+  box/.style={draw,rounded corners=2mm,align=center,minimum height=10mm,text width=30mm,font=\footnotesize},
+  genuine/.style={box,draw=kinetiqGreen,fill=softGreen},
+  synth/.style={box,draw=kinetiqOrange,fill=softOrange},
+  common/.style={box,draw=kinetiqBlue,fill=softBlue},
+  flow/.style={->,thick,draw=kinetiqBlue},
+  gflow/.style={->,thick,draw=kinetiqGreen},
+  oflow/.style={->,thick,draw=kinetiqOrange},
+  tierlabel/.style={font=\scriptsize\bfseries,align=center,text width=26mm}
+]
 
-\node[label,text=kinetiqOrange,below=9mm of glabel] (rlabel) {DETERMINISTIC\\CONTROL PATHWAY};
-\node[synth,right=of rlabel] (keys) {Keyboard control\\1 / 2 / 3 / b / 0};
-\node[synth,right=of keys] (native) {Native FreeRTOS v11\\tasks, queue, mutex};
-\node[synth,right=of native] (rtosjson) {Synthetic status\\telemetry + diagnostics};
-\draw[flow] (keys)--(native);
-\draw[flow] (native)--(rtosjson);
+% Coordinates
+% Row 1: y = 6.0
+\node[tierlabel,text=kinetiqGreen] (l1) at (0.0, 6.0) {GENUINE\\WEARABLE\\PATHWAY};
+\node[genuine] (band) at (3.8, 6.0) {Huawei Band 6\\Sensor Capture};
+\node[genuine] (health) at (7.3, 6.0) {Huawei Health\\Visible UI State};
+\node[genuine] (relay) at (10.8, 6.0) {Android Relay\\Streaming Service};
+\node[genuine] (recv) at (14.3, 6.0) {Authenticated\\Local Receiver};
 
-\node[label,text=kinetiqBlue,below=11mm of rlabel] (clabel) {SHARED\\APPLICATION LAYER};
-\node[common,right=of clabel] (bridge) {Genuine-only bridge\\or RTOS ingress};
-\node[common,right=of bridge] (schema) {Eight-field schema\\source + freshness};
-\node[common,right=of schema] (mirror) {Wellness mirror\\dashboard + assistant};
-\draw[flow] (post.south) |- (bridge.north);
-\draw[flow] (rtosjson.south) |- node[pos=.18,right,xshift=1.5mm,yshift=-3mm,font=\scriptsize,align=left]{synthetic\\label retained} (bridge.north);
-\draw[flow] (bridge)--(schema);
-\draw[flow] (schema)--(mirror);
-\end{tikzpicture}
-\caption[Overall KINETIQ architecture]{Overall KINETIQ architecture. The two source lanes converge only after their origin and eligibility are made explicit.}
+\draw[gflow] (band) -- (health);
+\draw[gflow] (health) -- (relay);
+\draw[gflow] (relay) -- (recv);
+
+% Row 2: y = 3.0
+\node[tierlabel,text=kinetiqOrange] (l2) at (0.0, 3.0) {DETERMINISTIC\\CONTROL\\PATHWAY};
+\node[synth] (keys) at (3.8, 3.0) {Console Controls\\1 / 2 / 3 / b / 0};
+\node[synth] (rtos) at (7.3, 3.0) {FreeRTOS Kernel\\Tasks, Queue, Mutex};
+\node[synth] (synthout) at (10.8, 3.0) {Synthetic Telemetry\\JSON Diagnostics};
+
+\draw[oflow] (keys) -- (rtos);
+\draw[oflow] (rtos) -- (synthout);
+
+% Row 3: y = 0.0
+\node[tierlabel,text=kinetiqBlue] (l3) at (0.0, 0.0) {SHARED\\APPLICATION\\LAYER};
+\node[common] (bridge) at (3.8, 0.0) {Telemetry Ingestion\\Bridge / Ingress};
+\node[common] (schema) at (7.3, 0.0) {Eight-Field Schema\\Source \& Freshness};
+\node[common] (mirror) at (10.8, 0.0) {Wellness Mirror\\Dashboard \& AI};
+
+\draw[flow] (bridge) -- (schema);
+\draw[flow] (schema) -- (mirror);
+
+% Inter-tier routing:
+% Synthetic route drops down to y = 1.5, goes horizontally to x = 3.8, and enters bridge.north
+\draw[oflow] (synthout.south) -- (10.8, 1.5) -- node[above,font=\scriptsize,text=kinetiqOrange]{synthetic label retained} (3.8, 1.5) -> (bridge.north);
+
+% Genuine route leaves recv.east, goes right to x = 16.2, drops down to y = -1.4, goes horizontally to x = 3.8, and enters bridge.south
+\draw[gflow] (recv.east) -- (16.2, 6.0) -- (16.2, -1.4) -- node[below,font=\scriptsize,text=kinetiqGreen,pos=0.45]{genuine data stream} (3.8, -1.4) -> (bridge.south);
+
+\end{tikzpicture}}
+\caption[Overall system architecture]{Overall system architecture of the Real-Time Wellness Mirror. The two source lanes converge only after their origin and eligibility are made explicit.}
 \label{fig:overall-architecture}
 \end{figure}
 
 \section{Genuine Wearable-Data Pathway}
-The genuine route starts at Huawei Band 6 observations displayed through Huawei Health. A phone-side service labelled \textit{KinetiQ Streamer} reads the relevant UI state under Android accessibility permission and submits a local POST payload. The local receiver records the incoming source, schema version, timestamp, value modes, device model, simulation status, transport, and steps. A receiver record is evidence of arrival at that receiver; it is not by itself evidence that a later browser tab displayed the same value.
+The genuine route starts at Huawei Band 6 observations displayed through Huawei Health. A phone-side service labelled \textit{KinetiQ Streamer} reads the relevant UI state under Android accessibility permission and submits an authenticated HTTP POST payload to the laptop receiver. The receiver (\nolinkurl{kinetiq_receiver.py}) binds to \code{0.0.0.0:8000} on the host laptop. In a wireless local demonstration, the phone transmits to \nolinkurl{http://<laptop-ip>:8000/api/wearable} across the private local Wi-Fi subnet. In an offline demonstration without network infrastructure, the phone connects via USB with Android Debug Bridge reverse port forwarding (\code{adb reverse tcp:8000 tcp:8000}), enabling the phone to submit payloads directly to \nolinkurl{http://127.0.0.1:8000/api/wearable}. On the laptop host, an internal bridge process (\code{band\_bridge.py}) polls \nolinkurl{http://127.0.0.1:8000/api/wearable/latest} and pipes validated packets via standard input to the dashboard application (\code{laptop/web/app.py}), which serves the mirror interface on loopback port 8777. The local receiver records the incoming source, schema version, timestamp, value modes, device model, simulation status, transport, and steps. A receiver record is evidence of arrival at that receiver; it is not by itself evidence that a later browser tab displayed the same value.
 
 The genuine-only bridge examines the relay snapshot before writing the shared schema to the mirror process. It requires complete HR, SpO\textsubscript{2}, and steps values; acceptable ranges; non-simulated origin; and the relay's \code{live} freshness classification. The bridge maps activity to \code{unknown}, motion intensity to \code{0}, PPG quality to \code{good} after an upstream completed SpO\textsubscript{2} reading, and exertion through the bridge's documented heuristic. Those mappings are compatibility values, not independently measured activity, motion, PPG signal quality, or exertion. Stress may be present in the relay record, but it is not a member of the locked eight-field mirror contract and is not forwarded by the examined bridge.
 
@@ -51,10 +69,11 @@ The native control application is a FreeRTOS v11 Windows-simulator executable. I
 
 \begin{table}[H]
 \centering
-\small
+\footnotesize
+\renewcommand{\arraystretch}{1.04}
 \caption{Native FreeRTOS task structure in the examined implementation.}
 \label{tab:rtos-tasks}
-\begin{tabularx}{\textwidth}{p{33mm}p{22mm}p{23mm}Y}
+\begin{tabularx}{\textwidth}{p{30mm}p{22mm}p{20mm}Y}
 \toprule
 \textbf{Task} & \textbf{Nominal cadence} & \textbf{Priority} & \textbf{Role}\\
 \midrule
@@ -68,64 +87,83 @@ Telemetry & 1 s & 3 & Builds synthetic contract telemetry; reports timing, queue
 
 The fall command is a control event in this simulator. It must not be interpreted as a validated fall-detection algorithm or a physical sensor result. The queue is configured to retain the newest virtual inputs when pressure occurs by dropping the oldest entry, with high-water mark and dropped-event counters exposed in diagnostics.
 
+\clearpage
 \section{Telemetry Validation and Freshness Workflow}
 Figure~\ref{fig:validation-flow} depicts the shared decision flow. Syntax alone is insufficient. Authentication applies to the receiver route; schema, complete-field, range, source, and freshness checks determine bridge or dashboard acceptance. A valid value that ceases to arrive is not kept in a live state indefinitely. The web layer tracks receiver arrival and fingerprint changes and transitions between \texttt{LIVE}, \texttt{UNCHANGED}, \texttt{STALE}, and \texttt{OFFLINE}; the documented values are blanked once offline.
 
 \begin{figure}[H]
 \centering
-\resizebox{0.94\textwidth}{!}{%
-\begin{tikzpicture}[font=\small,node distance=8mm and 12mm,>=Latex,
- process/.style={draw=kinetiqBlue,fill=softBlue,rounded corners=2mm,align=center,minimum height=9mm,text width=31mm},
- decision/.style={diamond,draw=kinetiqOrange,fill=softOrange,align=center,aspect=2,text width=24mm,inner sep=1mm},
- outcome/.style={draw=kinetiqGreen,fill=softGreen,rounded corners=2mm,align=center,minimum height=9mm,text width=30mm},
- reject/.style={draw=red!65!black,fill=red!8,rounded corners=2mm,align=center,minimum height=9mm,text width=28mm},
- flow/.style={->,thick,draw=kinetiqBlue}]
-\node[process] (in) {Incoming local POST, bridge snapshot, or RTOS JSON};
-\node[decision,right=of in] (auth) {authenticated route / recognised ingress?};
-\node[decision,right=of auth] (schema) {all eight fields, types, enum and range valid?};
-\node[decision,below=14mm of schema] (source) {eligible source and fresh enough?};
-\node[outcome,right=of schema] (accept) {Accept snapshot; record arrival and source};
-\node[outcome,right=of source] (dash) {Dashboard update; source, link and freshness visible};
-\node[outcome,below=of dash] (assist) {Accepted context to assistant; show grounding verdict};
-\node[reject,below=14mm of auth] (reject) {Reject and retain diagnostic reason; do not update wellness context};
-\draw[flow] (in)--(auth);
-\draw[flow] (auth)-- node[above,font=\scriptsize]{yes} (schema);
-\draw[flow] (auth)-- node[left,font=\scriptsize]{no} (reject);
-\draw[flow] (schema)-- node[above,font=\scriptsize]{yes} (accept);
-\draw[flow] (schema)|- node[pos=.25,right,font=\scriptsize]{no} (reject);
-\draw[flow] (accept) |- (source);
-\draw[flow] (source)-- node[above,font=\scriptsize]{yes} (dash);
-\draw[flow] (source)-| node[pos=.25,below,font=\scriptsize]{no} (reject);
-\draw[flow] (dash)--(assist);
+\vspace{-2mm}
+\resizebox{0.70\textwidth}{!}{%
+\begin{tikzpicture}[font=\small, >=Latex, node distance=3mm and 10mm,
+  proc/.style={draw=kinetiqBlue,fill=softBlue,rounded corners=2mm,align=center,minimum height=7mm,text width=46mm,font=\footnotesize},
+  dec/.style={diamond,draw=kinetiqOrange,fill=softOrange,align=center,aspect=2.8,text width=38mm,inner sep=0.5pt,font=\footnotesize},
+  outc/.style={draw=kinetiqGreen,fill=softGreen,rounded corners=2mm,align=center,minimum height=7mm,text width=46mm,font=\footnotesize},
+  rejc/.style={draw=red!70!black,fill=red!8,rounded corners=2mm,align=center,minimum height=16mm,text width=32mm,font=\footnotesize},
+  flow/.style={->,thick,draw=kinetiqBlue},
+  yflow/.style={->,thick,draw=kinetiqGreen},
+  nflow/.style={->,thick,draw=red!70!black}
+]
+
+% Central flow (top to bottom) with compact clean spacing
+\node[proc] (in) {Incoming Telemetry Payload\\(POST, Bridge, or RTOS)};
+
+\node[dec, below=3.5mm of in] (auth) {Authenticated route or\\recognised ingress?};
+
+\node[dec, below=3.5mm of auth] (source) {Eligible source and\\live freshness?};
+
+\node[dec, below=3.5mm of source] (schema) {All 8 fields, types\\and ranges valid?};
+
+\node[outc, below=3.5mm of schema] (accept) {Accept Snapshot\\Record arrival and provenance};
+
+\node[outc, below=3mm of accept] (dash) {Update Dashboard State\\Render vitals, link, and freshness};
+
+\node[outc, below=3mm of dash] (assist) {Condition AI Assistant\\Evaluate grounding verdict};
+
+% Single Reject block on the right, aligned with source
+\node[rejc, right=10mm of source] (reject) {\textbf{Reject Payload}\\[1.5mm]Log diagnostic reason;\\do not update mirror};
+
+% Main spine down
+\draw[flow] (in) -- (auth);
+\draw[yflow] (auth) -- node[right,font=\scriptsize]{yes} (source);
+\draw[yflow] (source) -- node[right,font=\scriptsize]{yes} (schema);
+\draw[yflow] (schema) -- node[right,font=\scriptsize]{yes} (accept);
+\draw[flow] (accept) -- (dash);
+\draw[flow] (dash) -- (assist);
+
+% Rejections cleanly to the right
+\draw[nflow] (auth.east) -| node[pos=0.35,above,font=\scriptsize]{no} (reject.north);
+\draw[nflow] (source.east) -- node[above,font=\scriptsize]{no} (reject.west);
+\draw[nflow] (schema.east) -| node[pos=0.35,below,font=\scriptsize]{no} (reject.south);
+
 \end{tikzpicture}}
+\vspace{-2mm}
 \caption[Validation and freshness workflow]{Validation and freshness workflow. The genuine bridge adds source-specific completeness and live-freshness guards before it emits the shared contract.}
 \label{fig:validation-flow}
+\vspace{-2mm}
 \end{figure}
 
+\clearpage
 \section{Dashboard and Assistance Layer}
 The laptop dashboard runs a threaded HTTP server on loopback, tries port 8777 and then 8778 when necessary, and ingests valid JSON through standard input or application endpoints. It maintains a snapshot plus arrival and value-change times. The cards show accepted wellness context along with the source and data state. Browser-camera handling is limited to a pixel-difference motion proxy; no implemented pose or posture classifier is claimed.
 
-\begin{figure}[htbp]
-\centering
-\includegraphics[width=\textwidth]{ui_live.png}
-\caption[Dashboard mirror with synthetic stream (not live)]{Implemented dashboard mirror rendered in the browser during a controlled local input session; the displayed stream is synthetic, not live wearable telemetry.}
+\begin{center}
+\vspace{-3mm}
+\includegraphics[width=0.40\textwidth]{ui_live.png}
+\captionof{figure}[Dashboard mirror with synthetic stream]{Implemented dashboard mirror rendered in the browser during a controlled local input session; the displayed stream is synthetic, not live wearable telemetry.}
 \label{fig:dashboard-live}
-\end{figure}
+\vspace{-3mm}
+\end{center}
 
-The assistant accepts the current validated context, attempts a local Ollama \code{gemma2:2b} response where available, and otherwise uses a deterministic template.
-
-Responses are bounded to 70 words.
-
-The verifier checks specified agreement with activity, exertion, an exact HR/heart value or step count, and poor-quality wording when applicable. The process shows \texttt{PASS} or \texttt{FAIL}; the examined implementation still sends text to speech after a failed check, so the verdict is informative rather than a fail-closed safety gate.
+The assistant accepts validated context, queries local Ollama \code{gemma2:2b} where available, or reverts to a deterministic template (bounded to 70 words). The verifier checks agreement with activity, exertion, exact HR/steps, or poor PPG quality, rendering an informative \texttt{PASS} or \texttt{FAIL} tag without interrupting speech synthesis.
 
 \section{Hardware Design Scope}
-The selected embedded components are an ESP32 DevKit V1, MPU6050, HC-SR04, infrared sensor, DHT22, and supporting wiring/prototyping materials. The materials include pin mapping and a Wokwi sketch. Figure~\ref{fig:hardware-concept} reproduces the project material's earlier hardware-path diagram as a conceptual design reference. It is not used as evidence of final physical sensor acquisition.
+The planned embedded node comprises an ESP32 DevKit V1, MPU6050, HC-SR04, infrared sensor, and DHT22. Figure~\ref{fig:hardware-concept} reproduces the earlier hardware-path diagram as a conceptual reference; physical sensor ingestion remains planned and unverified on deployed hardware.
 
-\begin{figure}[htbp]
-\centering
-\includegraphics[width=0.82\textwidth]{existing_architecture.png}
-\caption[Earlier hardware-path conceptual architecture]{Earlier hardware-path conceptual architecture from the KINETIQ project materials. The physical ESP32 sensing path remained planned/simulated at the documented final demonstration.}
+\begin{center}
+\vspace{-3mm}
+\includegraphics[width=0.32\textwidth]{existing_architecture.png}
+\captionof{figure}[Earlier conceptual hardware-path architecture]{Earlier conceptual hardware-path architecture. The physical ESP32 sensing path remained planned and simulated at the documented final demonstration.}
 \label{fig:hardware-concept}
-\end{figure}
-
-The ESP32 and sensor selection remains technically appropriate for a future sensing node, but physical wiring, calibration, power behaviour, environmental response, and end-to-end sensor ingestion require separate validation. Wokwi execution can exercise the modelled sketch, not replace those measurements.
+\vspace{-3mm}
+\end{center}

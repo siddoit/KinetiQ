@@ -1,7 +1,7 @@
 \chapter{CONCLUSION AND FUTURE SCOPE}
 
 \section{Conclusion}
-KINETIQ establishes a transparent local wellness-mirror architecture built around two non-equivalent telemetry pathways.
+This minor project demonstrates a transparent local wellness-mirror architecture, implemented through the KINETIQ application, built around two non-equivalent telemetry pathways.
 
 The Huawei Band 6 route carries Huawei Health user-interface observations through an Android accessibility relay and authenticated local receiver. The native FreeRTOS v11 route supplies deterministic, explicitly synthetic control telemetry with queue and timing diagnostics. The common application layer accepts only an eight-field schema, exposes source and freshness state, and conditions assistance on the accepted context.
 
@@ -11,8 +11,7 @@ The central engineering contribution is the provenance and freshness boundary: t
 
 \section{Future Scope}
 Priority future work follows directly from the outstanding evidence gaps:
-
-\begin{enumerate}
+\begin{enumerate}[noitemsep,topsep=2pt]
   \item complete a physical ESP32 sensor node and record calibrated MPU6050, HC-SR04, infrared, and DHT22 acquisition under stated test conditions;
   \item create end-to-end trace fixtures that link a Huawei Health UI capture, authenticated receiver row, bridge emission, and dashboard rendering without exposing personal data;
   \item extend the shared contract only through versioned validation, including an explicit decision on stress representation and its freshness semantics;

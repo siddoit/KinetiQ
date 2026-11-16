@@ -1,4 +1,7 @@
-"""KINETIQ browser mirror dashboard (single file, stdlib only).
+"""KINETIQ browser mirror dashboard (stdlib-only backend).
+
+Serves templates/index.html plus static/css/style.css and static/js/app.js;
+no third-party web framework is required.
 
 Engine mode (default): background thread ticks mock_streamer at 1 Hz.
 Stdin mode (--stdin): read JSON lines from stdin, validate, ignore non-JSON.
@@ -17,21 +20,25 @@ Usage:
 
 from __future__ import annotations
 
+import collections
 import io
 import json
+import mimetypes
 import os
 import re
 import subprocess
 import sys
 import threading
 import time
-import urllib.request
 import urllib.error
 import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_TEMPLATES_DIR = os.path.join(_HERE, "templates")
+_STATIC_DIR = os.path.join(_HERE, "static")
 _LAPTOP_DIR = os.path.dirname(_HERE)
 _RECEIVER_DIR = os.path.join(_LAPTOP_DIR, "receiver")
 _AI_DIR = os.path.join(_LAPTOP_DIR, "ai")
@@ -72,8 +79,10 @@ def _parse_lane(argv):
 LANE = _parse_lane(sys.argv[1:])
 _ACTIVE_MODE = "rtos" if (LANE == "rtos") else "band"
 
+
 def _current_lane_label():
     return LANE_LABELS.get(_ACTIVE_MODE, "LANE A \u00b7 REAL BAND")
+
 
 LANE_LABEL = _current_lane_label()
 
@@ -112,9 +121,34 @@ _fresh = {
     "arrivals": 0,
 }
 
+# Track last ingested upstream Band 6 POST so polling does not fabricate 1 Hz arrivals
+_band_state = {
+    "last_post_key": None,
+}
+
+
+def _reset_telemetry_state():
+    """Clear active telemetry & freshness clocks on mode switch to prevent provenance bleed."""
+    global _latest
+    with _lock:
+        _latest = None
+        _history.clear()
+        _fresh["first_seen_at"] = None
+        _fresh["arrival_at"] = None
+        _fresh["value_changed_at"] = None
+        _fresh["value_changed_witnessed"] = False
+        _fresh["fingerprint"] = None
+        _fresh["arrivals"] = 0
+        _band_state["last_post_key"] = None
+
+
 # ---- camera-as-sensor state (browser motion -> server hysteresis band)
-_cam = {"motion": 0.0, "ts": 0.0, "band": "rest",
-        "switch_t": time.monotonic()}
+_cam = {
+    "motion": 0.0,
+    "ts": 0.0,
+    "band": "rest",
+    "switch_t": time.monotonic(),
+}
 _CAM_FRESH_S = 3.0
 _CAM_REST_MAX = 0.08
 _CAM_RUN_MIN = 0.25
@@ -161,6 +195,7 @@ def _current_source(now=None):
         return "NATIVE NODE"
     return "CAMERA" if _cam_fresh(now) else "FREERTOS NODE"
 
+
 # ---- live assistant stack (primary path: grounded on CURRENT screen packet)
 _AI = {}
 
@@ -194,7 +229,7 @@ def _payload7(packet):
     }
 
 
-def _ask_live(question, timeout_s=25.0):
+def _ask_live(question, timeout_s=35.0):
     """Primary: AIAdvisor on the CURRENT latest packet. Returns (answer, grounding)."""
     with _lock:
         pkt = dict(_latest) if _latest else None
@@ -206,7 +241,7 @@ def _ask_live(question, timeout_s=25.0):
                 if _latest:
                     pkt = dict(_latest)
                     break
-    if pkt is None and build_packet is not None:
+    if pkt is None and build_packet is not None and _ACTIVE_MODE == "rtos":
         try:
             st = StreamerState(interval_s=1.0) if StreamerState else None
             pkt = build_packet(st) if st else None
@@ -218,19 +253,28 @@ def _ask_live(question, timeout_s=25.0):
     advisor_cls = _AI["advisor_cls"]
     verify = _AI["verify"]
     template = _AI["template"]
-    advisor = advisor_cls(timeout=min(20.0, timeout_s - 2.0))
+    advisor = advisor_cls(timeout=min(30.0, timeout_s - 2.0))
     box = {}
 
     def _run():
         try:
             with _VISION_LOCK:
                 ts = _MIRROR_VISION.get("timestamp", 0)
-                vis = dict(_MIRROR_VISION) if (ts > 0 and (time.time() - ts) < 30.0) else None
-            box["reply"] = advisor.advise(payload, question, visual_context=vis)
+                vis = (
+                    dict(_MIRROR_VISION)
+                    if (ts > 0 and (time.time() - ts) < 30.0)
+                    else None
+                )
+            ans = advisor.advise(payload, question, visual_context=vis)
+            if not str(ans or "").strip():
+                ans = template(payload)
+            box["reply"] = ans
+            box["backend"] = getattr(advisor, "last_backend", "")
         except Exception as exc:  # noqa - LLM down -> template fallback
             box["fallback_err"] = str(exc)
             try:
                 box["reply"] = template(payload)
+                box["backend"] = "template"
             except Exception as exc2:  # noqa
                 box["error"] = str(exc2)
 
@@ -243,10 +287,18 @@ def _ask_live(question, timeout_s=25.0):
     if not reply:
         raise RuntimeError("assistant returned an empty reply")
     failures = verify(reply, payload)
+    # Self-heal live LLM drifts (when running against real Ollama/API backend)
+    if failures and box.get("backend") in ("ollama", "api"):
+        try:
+            healed = str(template(payload) or "").strip()
+            if healed and not verify(healed, payload):
+                return (healed, "PASS")
+        except Exception:
+            pass
     return (reply, "PASS" if not failures else "FAIL")
 
 
-def _ask_subprocess(question, timeout_s=25.0):
+def _ask_subprocess(question, timeout_s=35.0):
     """Fallback: laptop/.venv/Scripts/python.exe laptop/ai/assistant.py --query."""
     root = os.path.dirname(os.path.dirname(_LAPTOP_DIR))
     venv_py = os.path.join(root, "laptop", ".venv", "Scripts", "python.exe")
@@ -260,7 +312,9 @@ def _ask_subprocess(question, timeout_s=25.0):
     try:
         proc = subprocess.run(
             cmd,
-            capture_output=True, text=True, timeout=timeout_s,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
         )
     except subprocess.TimeoutExpired:
         raise TimeoutError("assistant timed out after %.0fs" % timeout_s)
@@ -286,8 +340,11 @@ def _ask_subprocess(question, timeout_s=25.0):
                 break
     if not answer.strip():
         # last resort: whole stdout minus bracketed log lines
-        kept = [ln for ln in (proc.stdout or "").splitlines()
-                if ln.strip() and not ln.startswith("[")]
+        kept = [
+            ln
+            for ln in (proc.stdout or "").splitlines()
+            if ln.strip() and not ln.startswith("[")
+        ]
         answer = " ".join(kept).strip()
     if not answer.strip():
         raise RuntimeError("assistant subprocess produced no reply")
@@ -302,8 +359,11 @@ def ask_question(question):
         try:
             return _ask_live(question)
         except Exception as exc:  # noqa - fall through to subprocess
-            print("[ask] live import failed (%s); subprocess fallback" % exc,
-                  file=sys.stderr, flush=True)
+            print(
+                "[ask] live import failed (%s); subprocess fallback" % exc,
+                file=sys.stderr,
+                flush=True,
+            )
     return _ask_subprocess(question)
 
 
@@ -311,7 +371,10 @@ def ask_question(question):
 _STT_LOCK = threading.Lock()
 _STT = {"transcriber": None, "err": None}
 _TTS_LOCK = threading.Lock()
-MAX_AUDIO_BYTES = 2_000_000  # ~1 MB cap (webm clips are tiny; wav tests fit)
+_TTS_CACHE_LOCK = threading.Lock()
+_TTS_CACHE: collections.OrderedDict[tuple[str, str], bytes] = collections.OrderedDict()
+_TTS_CACHE_MAX = 24
+MAX_AUDIO_BYTES = 2_000_000  # ~2 MB cap (webm clips are tiny; wav tests fit)
 
 
 def _get_transcriber():
@@ -351,6 +414,10 @@ def _decode_to_mono16k(audio_bytes):
     container = av.open(buf, mode="r", metadata_errors="ignore")
     stream = next((s for s in container.streams.audio), None)
     if stream is None:
+        try:
+            container.close()
+        except Exception:
+            pass
         raise ValueError("no audio stream found")
     resampler = av.AudioResampler(format="flt", layout="mono", rate=16000)
     chunks = []
@@ -369,9 +436,7 @@ def _decode_to_mono16k(audio_bytes):
         pass
     if not chunks:
         raise ValueError("could not decode any audio frames")
-    import numpy as _np
-
-    return _np.concatenate(chunks).astype(_np.float32, copy=False)
+    return np.concatenate(chunks).astype(np.float32, copy=False)
 
 
 def transcribe_audio_bytes(audio_bytes, timeout_s=15.0):
@@ -387,7 +452,17 @@ def transcribe_audio_bytes(audio_bytes, timeout_s=15.0):
 
     def _run():
         try:
-            segments, _info = tr._model.transcribe(mono, language="en")
+            try:
+                segments, _info = tr._model.transcribe(
+                    mono,
+                    language="en",
+                    beam_size=1,
+                    best_of=1,
+                    without_timestamps=True,
+                    condition_on_previous_text=False,
+                )
+            except TypeError:
+                segments, _info = tr._model.transcribe(mono, language="en")
             box["text"] = "".join(s.text for s in segments).strip()
         except Exception as exc:  # noqa
             box["error"] = "%s: %s" % (type(exc).__name__, exc)
@@ -410,13 +485,24 @@ def _speak_async(text):
 
     def _run():
         with _TTS_LOCK:
+            com_init = False
             try:
+                try:
+                    import pythoncom  # type: ignore
+
+                    pythoncom.CoInitialize()
+                    com_init = True
+                except Exception:
+                    pass
                 import pyttsx3
 
                 eng = pyttsx3.init()
                 try:
                     for v in eng.getProperty("voices"):
-                        if "zira" in v.name.lower() or "female" in str(getattr(v, "gender", "")).lower():
+                        if (
+                            "zira" in v.name.lower()
+                            or "female" in str(getattr(v, "gender", "")).lower()
+                        ):
                             eng.setProperty("voice", v.id)
                             break
                     eng.setProperty("rate", 165)
@@ -429,8 +515,19 @@ def _speak_async(text):
                 except Exception:
                     pass
             except Exception as exc:  # noqa - headless/TTS failure is non-fatal
-                print("[tts] disabled (%s: %s)" % (type(exc).__name__, exc),
-                      file=sys.stderr, flush=True)
+                print(
+                    "[tts] disabled (%s: %s)" % (type(exc).__name__, exc),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            finally:
+                if com_init:
+                    try:
+                        import pythoncom  # type: ignore
+
+                        pythoncom.CoUninitialize()
+                    except Exception:
+                        pass
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -438,13 +535,17 @@ def _speak_async(text):
 def _patch_windows_socketpair():
     """Windows Hyper-V/NAT dynamic port collisions can break socketpair(host, 0)."""
     import socket
+
     if getattr(socket, "_kinetiq_patched", False):
         return
     orig = getattr(socket, "socketpair", None)
+
     def _safe_socketpair(family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0):
         for port in range(49200, 49950):
             lsock = socket.socket(family, type, proto)
+            csock = None
             try:
+                lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 lsock.bind(("127.0.0.1", port))
                 lsock.listen(1)
                 csock = socket.socket(family, type, proto)
@@ -453,30 +554,39 @@ def _patch_windows_socketpair():
                 lsock.close()
                 return (ssock, csock)
             except Exception:
-                try:
-                    lsock.close()
-                except Exception:
-                    pass
+                for s in (csock, lsock):
+                    if s is not None:
+                        try:
+                            s.close()
+                        except Exception:
+                            pass
                 continue
         if orig:
             return orig(family, type, proto)
+        raise OSError("Unable to establish local socketpair")
+
     socket.socketpair = _safe_socketpair
-    socket._kinetiq_patched = True
+    socket._kinetiq_patched = True  # type: ignore[attr-defined]
 
 
-def synthesize_neural_tts(text: str, voice: str = "en-US-JennyNeural") -> Optional[bytes]:
+def synthesize_neural_tts(text: str, voice: str = "en-US-JennyNeural") -> bytes | None:
     """Generate high-definition Microsoft Jenny Neural TTS MP3 audio via edge-tts."""
     msg = (text or "").strip()
     if not msg:
         return None
+    clean = re.sub(r"[*_#`~]", "", msg).strip()
+    if not clean:
+        return None
+    cache_key = (voice, clean)
+    with _TTS_CACHE_LOCK:
+        cached = _TTS_CACHE.get(cache_key)
+        if cached is not None:
+            _TTS_CACHE.move_to_end(cache_key)
+            return cached
     try:
         _patch_windows_socketpair()
         import asyncio
         import edge_tts
-
-        clean = re.sub(r'[*_#`~]', '', msg).strip()
-        if not clean:
-            return None
 
         async def _produce():
             comm = edge_tts.Communicate(clean, voice)
@@ -486,7 +596,13 @@ def synthesize_neural_tts(text: str, voice: str = "en-US-JennyNeural") -> Option
                     chunks.append(chunk["data"])
             return b"".join(chunks)
 
-        return asyncio.run(_produce())
+        audio = asyncio.run(_produce())
+        if audio:
+            with _TTS_CACHE_LOCK:
+                _TTS_CACHE[cache_key] = audio
+                while len(_TTS_CACHE) > _TTS_CACHE_MAX:
+                    _TTS_CACHE.popitem(last=False)
+        return audio
     except Exception:
         return None
 
@@ -573,7 +689,11 @@ def _freshness(now=None):
             value_age = max(0.0, now - (changed if changed is not None else arrival))
             if value_age < _LIVE_S:
                 state = "LIVE"
-                label = ("changed " if witnessed else "first seen ") + _fmt_age(value_age) + " ago"
+                label = (
+                    ("changed " if witnessed else "first seen ")
+                    + _fmt_age(value_age)
+                    + " ago"
+                )
             else:
                 state, label = "UNCHANGED", "first seen " + _fmt_age(value_age) + " ago"
 
@@ -581,11 +701,15 @@ def _freshness(now=None):
         "state": state,
         "label": label,
         "age_s": None if age is None else round(age, 2),
-        "value_age_s": (None if (arrival is None or changed is None)
-                        else round(max(0.0, now - changed), 2)),
+        "value_age_s": (
+            None
+            if (arrival is None or changed is None)
+            else round(max(0.0, now - changed), 2)
+        ),
         "witnessed": bool(witnessed),
-        "first_seen_s": (None if first is None
-                         else round(max(0.0, now - first), 2)),
+        "first_seen_s": (
+            None if first is None else round(max(0.0, now - first), 2)
+        ),
         "arrivals": arrivals,
         "live_s": _LIVE_S,
         "stale_s": _STALE_S,
@@ -619,8 +743,8 @@ def _store(packet_dict):
     with _lock:
         _latest = packet_dict
         _history.append(packet_dict)
-        while len(_history) > 90:
-            _history.pop(0)
+        if len(_history) > 90:
+            del _history[:-90]
         _fresh["arrivals"] += 1
         _fresh["arrival_at"] = now
         if _fresh["first_seen_at"] is None:
@@ -631,6 +755,34 @@ def _store(packet_dict):
             _fresh["value_changed_witnessed"] = _fresh["fingerprint"] is not None
             _fresh["fingerprint"] = fingerprint
             _fresh["value_changed_at"] = now
+
+
+def _parse_epoch_seconds(raw_ts) -> int | None:
+    """Parse an ISO-8601 or numeric timestamp into Unix epoch seconds, or None."""
+    if raw_ts is None:
+        return None
+    if isinstance(raw_ts, (int, float)):
+        val = float(raw_ts)
+        if val > 1e12:
+            val /= 1000.0
+        return int(val) if val > 0 else None
+    try:
+        s = str(raw_ts).strip()
+        if not s:
+            return None
+        if s.isdigit():
+            val = float(s)
+            if val > 1e12:
+                val /= 1000.0
+            return int(val)
+        if s.endswith(("Z", "z")):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return None
 
 
 def _band_collector_loop():
@@ -647,29 +799,56 @@ def _band_collector_loop():
         try:
             req = urllib.request.Request(
                 "http://127.0.0.1:8000/api/wearable/latest",
-                headers={"Accept": "application/json"}
+                headers={"Accept": "application/json"},
             )
             with urllib.request.urlopen(req, timeout=1.8) as resp:
                 snap = json.loads(resp.read().decode("utf-8"))
             real = snap.get("real")
             if isinstance(real, dict) and real.get("simulated") is False:
+                # Reject upstream snapshots explicitly marked offline by receiver
+                upstream_fresh = str(real.get("freshness") or "").lower()
+                if upstream_fresh == "offline":
+                    time.sleep(1.0)
+                    continue
+
                 hr = real.get("heart_rate_bpm")
                 spo2 = real.get("spo2_percent")
                 steps = real.get("steps", 0)
                 if hr is not None and spo2 is not None:
-                    ts_val = int(time.time())
-                    raw_ts = real.get("timestamp")
-                    if raw_ts:
-                        try:
-                            val = str(raw_ts).strip()
-                            if val.endswith(("Z", "z")):
-                                val = val[:-1] + "+00:00"
-                            dt = datetime.fromisoformat(val)
-                            ts_val = int(dt.timestamp())
-                        except Exception:
-                            pass
-                    if ts_val <= 0:
-                        ts_val = int(time.time())
+                    now_wall = time.time()
+                    parsed_ts = _parse_epoch_seconds(
+                        real.get("received_at") or real.get("timestamp")
+                    )
+                    ts_val = parsed_ts if (parsed_ts and parsed_ts > 0) else int(now_wall)
+
+                    # Deduplicate polling: only record a new arrival when the phone
+                    # actually sends a new POST (new timestamp/received_at/values).
+                    post_key = (
+                        real.get("received_at"),
+                        real.get("timestamp"),
+                        hr,
+                        spo2,
+                        steps,
+                    )
+                    with _lock:
+                        last_key = _band_state["last_post_key"]
+                        has_arrivals = _fresh["arrivals"] > 0
+
+                    if post_key == last_key:
+                        # No new POST arrived at kinetiq_receiver since our last poll.
+                        # Do not call _store(), so STALE (>60s) and OFFLINE (>300s)
+                        # clocks advance honestly when the phone stops transmitting.
+                        time.sleep(1.0)
+                        continue
+
+                    # On first sight, ignore ancient cached receiver rows (>300s old)
+                    if not has_arrivals and parsed_ts is not None:
+                        age_wall = now_wall - parsed_ts
+                        if age_wall > _OFFLINE_S:
+                            with _lock:
+                                _band_state["last_post_key"] = post_key
+                            time.sleep(1.0)
+                            continue
 
                     hr_int = int(hr)
                     spo2_int = int(round(float(spo2)))
@@ -677,7 +856,15 @@ def _band_collector_loop():
                     if derive_exertion:
                         exert = derive_exertion(hr_int, "unknown")
                     else:
-                        exert = "rest" if hr_int < 80 else ("light" if hr_int < 100 else ("moderate" if hr_int < 130 else "high"))
+                        exert = (
+                            "rest"
+                            if hr_int < 80
+                            else (
+                                "light"
+                                if hr_int < 100
+                                else ("moderate" if hr_int < 130 else "high")
+                            )
+                        )
 
                     # Honest Band 6 contract (matches band_bridge.py):
                     # Activity and motion are not relayed by hardware -> marked honest placeholders.
@@ -692,8 +879,10 @@ def _band_collector_loop():
                         "steps": steps_int,
                         "ppg_quality": "good",
                     }
-                    if TelemetryRecord:
+                    if TelemetryRecord and _ACTIVE_MODE == "band":
                         rec = TelemetryRecord.parse(pkt)
+                        with _lock:
+                            _band_state["last_post_key"] = post_key
                         _store(rec.to_dict())
         except urllib.error.URLError:
             pass  # quiet polling when receiver is offline
@@ -717,7 +906,7 @@ def _engine_loop():
                     m = float(_cam.get("motion", 0.0))
                 band = _cam_band_update(m, now)
                 phase = band if band in ("rest", "walk", "run") else "rest"
-                state._locate_phase = (lambda _p=phase: (_p, 0.0))
+                state._locate_phase = lambda _p=phase: (_p, 0.0)
             else:
                 try:
                     state._locate_phase = _orig_locate
@@ -725,7 +914,8 @@ def _engine_loop():
                     pass
             raw = build_packet(state)
             rec = TelemetryRecord.parse(raw)
-            _store(rec.to_dict())
+            if _ACTIVE_MODE == "rtos":
+                _store(rec.to_dict())
         except Exception as exc:  # noqa - never kill the feed
             global _rejects
             with _lock:
@@ -753,1036 +943,366 @@ def _stdin_loop():
     print("[stdin] pipe closed (EOF received)", file=sys.stderr, flush=True)
 
 
-PAGE = """
-<!DOCTYPE html>
+# ---- Static & Template File Resolution --------------------------------------
+
+_ALLOWED_STATIC_EXTS = frozenset(
+    {
+        ".css",
+        ".js",
+        ".mjs",
+        ".html",
+        ".htm",
+        ".svg",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".gif",
+        ".ico",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".otf",
+        ".mp3",
+        ".wav",
+        ".ogg",
+        ".webm",
+        ".json",
+        ".map",
+        ".txt",
+    }
+)
+
+# Explicit MIME overrides so Windows Registry quirks never serve .css/.js as text/plain
+_MIME_OVERRIDES = {
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".mjs": "application/javascript; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
+    ".htm": "text/html; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+}
+
+_FAVICON_SVG = (
+    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    b'<rect width="32" height="32" rx="7" fill="#070b12"/>'
+    b'<rect x="7" y="7" width="18" height="18" rx="4" fill="#2f81f7"/>'
+    b'<circle cx="16" cy="16" r="4.5" fill="#34d399"/>'
+    b"</svg>"
+)
+
+_FALLBACK_HTML = """<!DOCTYPE html>
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<title>KINETIQ Mirror</title>
-<style>
-/* ------------------------------------------------------------------------
-   KINETIQ stage mirror. Flat instrument panel: near-black bays separated by
-   1px hairlines, one blue accent (#2f81f7), semantic colours only for state.
-   Designed at 1280x720 first, scaled up to 1080p: every font-size clamp
-   carries a px floor so projection never shrinks below legibility.
-   One viewport, no page scroll, system fonts only.
-   ------------------------------------------------------------------------ */
-:root{
-  --bg:#05070a;
-  --line:rgba(255,255,255,.09);
-  --line-2:rgba(255,255,255,.16);
-  --fg:#f2f5fa;
-  --fg-2:#a9b4c3;
-  --fg-3:#7b8798;
-  --accent:#2f81f7;
-  --ok:#39e56b;
-  --warn:#ffb020;
-  --bad:#ff5347;
-  --t:190ms;
-}
-*{box-sizing:border-box}
-html{height:100%}
-body{
-  margin:0;padding:0;
-  height:100vh;width:100vw;overflow:hidden;
-  background:var(--bg);
-  color:var(--fg);
-  font-family:"Segoe UI Variable Text","Segoe UI Variable","Segoe UI",Inter,system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;
-  font-size:16px;
-  -webkit-font-smoothing:antialiased;
-  display:grid;
-  grid-template-rows:auto minmax(0,1fr) auto;
-}
-.num{font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1,"lnum" 1}
-
-/* ---- header: wordmark left, one compact status cluster right --------- */
-header{
-  display:flex;align-items:center;justify-content:space-between;
-  gap:24px;padding:10px 24px;
-  border-bottom:1px solid var(--line);
-  min-width:0;
-}
-.brand{display:flex;align-items:center;gap:12px;min-width:0}
-.mark{width:9px;height:9px;background:var(--accent);flex:0 0 auto}
-.wordmark{
-  margin:0;font-size:clamp(16px,1.9vh,19px);font-weight:800;
-  letter-spacing:.12em;line-height:1.25;white-space:nowrap;
-}
-.tag{
-  font-size:clamp(16px,1.6vh,17px);color:var(--fg-3);letter-spacing:.04em;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;
-}
-.hud{display:flex;align-items:center;gap:12px;flex:0 0 auto}
-
-/* source mode switch: band vs rtos */
-.mode-switch{
-  display:inline-flex;align-items:center;gap:3px;
-  background:rgba(255,255,255,.06);padding:3px;border-radius:4px;
-  border:1px solid var(--line-2);
-}
-.mode-btn{
-  font:inherit;font-size:clamp(12px,1.4vh,14px);font-weight:700;
-  padding:.32em .75em;background:transparent;color:var(--fg-3);
-  border:none;border-radius:3px;cursor:pointer;transition:all .15s ease;
-  white-space:nowrap;
-}
-.mode-btn:hover{color:var(--fg);background:rgba(255,255,255,.08)}
-.mode-btn.active{background:var(--accent);color:#fff}
-.mode-btn.active.rtos{background:#238636;color:#fff}
-
-/* object 1: source/lane chip - deliberately muted, the state owns attention */
-.chip{
-  display:inline-flex;align-items:center;gap:8px;
-  font-size:clamp(16px,1.6vh,16px);font-weight:600;letter-spacing:.1em;
-  color:var(--fg-3);border:1px solid var(--line);border-radius:3px;
-  padding:.42em .8em;white-space:nowrap;
-}
-.chip .sep{opacity:.6}
-#src.cam{color:#c9962f}
-
-/* object 2: the single primary state indicator */
-.stpill{
-  font-size:clamp(18px,2vh,21px);font-weight:800;letter-spacing:.14em;
-  padding:.42em .9em;border-radius:3px;white-space:nowrap;
-  border:1px solid var(--line-2);color:var(--fg-3);min-width:11ch;text-align:center;
-  transition:color var(--t) ease,background var(--t) ease,border-color var(--t) ease;
-}
-.stpill::before{
-  content:"";display:inline-block;width:.5em;height:.5em;border-radius:1px;
-  background:currentColor;margin-right:.6em;vertical-align:middle;
-}
-#stChip.LIVE{color:var(--ok);border-color:rgba(57,229,107,.5);background:rgba(57,229,107,.10)}
-#stChip.UNCHANGED{color:var(--warn);border-color:rgba(255,176,32,.5);background:rgba(255,176,32,.10)}
-#stChip.STALE{color:var(--bad);border-color:rgba(255,83,71,.5);background:rgba(255,83,71,.10)}
-#stChip.OFFLINE{color:var(--fg-3);border-color:var(--line-2);background:transparent}
-
-/* object 3: LINK dot + age + clock, one borderless muted text group */
-.linkgrp{display:flex;align-items:center;gap:12px;font-size:clamp(18px,1.8vh,20px);white-space:nowrap}
-.badge{font-weight:700;letter-spacing:.1em;color:var(--bad)}
-.badge::before{
-  content:"";display:inline-block;width:.55em;height:.55em;border-radius:50%;
-  background:currentColor;margin-right:.55em;vertical-align:middle;
-}
-.badge.up{color:var(--ok)}
-#stAge{color:var(--fg-2);min-width:20ch;font-variant-numeric:tabular-nums}
-#clock{color:var(--fg-3);min-width:8ch;font-variant-numeric:tabular-nums}
-
-/* ---- layout: vitals own the clear majority of width ------------------ */
-main{
-  display:grid;grid-template-columns:minmax(0,1fr) minmax(0,32%);
-  gap:20px;padding:20px 24px;min-height:0;overflow:hidden;
-}
-.col{display:grid;gap:16px;min-height:0;min-width:0}
-.col.left{grid-template-rows:1.35fr 1fr 0.55fr}
-.col.right{grid-template-rows:auto minmax(56px,1fr)}
-/* flat instrument bays: no card fill, no radius, no blur - hairlines only */
-.zone{
-  position:relative;min-width:0;min-height:0;overflow:hidden;
-  border:1px solid var(--line);border-radius:4px;background:transparent;
-  padding:16px 20px;display:flex;flex-direction:column;
-}
-.head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;min-width:0;flex:0 0 auto}
-.eyebrow{
-  font-size:clamp(17px,1.8vh,18px);font-weight:700;letter-spacing:.16em;
-  text-transform:uppercase;color:var(--fg-3);white-space:nowrap;
-  overflow:hidden;text-overflow:ellipsis;min-width:0;
-}
-.age{
-  font-size:clamp(16px,1.6vh,17px);color:var(--fg-3);
-  white-space:nowrap;flex:0 0 auto;font-variant-numeric:tabular-nums;
-}
-.note{font-size:clamp(16px,1.6vh,17px);color:var(--fg-3);white-space:nowrap}
-/* OFFLINE only: there is genuinely nothing to show, so values blank + dim */
-.dim{opacity:.3;filter:grayscale(1);transition:opacity var(--t) ease,filter var(--t) ease}
-
-/* ---- hero: heart rate ---------------------------------------------- */
-.hero{justify-content:center;gap:8px}
-#vals{display:flex;flex-direction:column;justify-content:center;gap:6px;min-height:0}
-.hero-top{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0}
-.act{
-  font-size:clamp(18px,1.9vh,19px);font-weight:800;letter-spacing:.14em;
-  padding:.35em .8em;border-radius:3px;white-space:nowrap;min-width:5ch;text-align:center;
-  border:1px solid var(--line-2);color:var(--fg-2);
-}
-.act.rest{color:var(--ok);border-color:rgba(57,229,107,.45)}
-.act.walk{color:var(--warn);border-color:rgba(255,176,32,.45)}
-.act.run{color:var(--bad);border-color:rgba(255,83,71,.45)}
-/* BPM is baseline-anchored to the numeral at a fixed offset: min-width 3ch
-   plus tabular figures means digit-count changes never move the unit. */
-.hero-num{
-  display:flex;align-items:baseline;justify-content:center;gap:.06em;
-  font-size:clamp(96px,24vh,240px);line-height:.92;
-}
-#hr{font-weight:800;letter-spacing:-.03em;min-width:3ch;text-align:right}
-.unit{font-size:.16em;font-weight:700;letter-spacing:.14em;color:var(--fg-2)}
-#ageH{text-align:center}
-
-/* Freshness must be readable at 5 m without reading text, and no state may
-   look like a rendering failure:
-     LIVE       full white
-     UNCHANGED  numeral stays full white; age + state pill go amber
-     STALE      numeral stays full white (dimming reads as "broken" at the
-                back of a room) + subtle amber ring on the hero bay; age +
-                state pill red
-     OFFLINE    the only state allowed to blank/dim (.dim on #vals/#vals2) */
-body[data-st="UNCHANGED"] #ageH,
-body[data-st="UNCHANGED"] #ageM,
-body[data-st="UNCHANGED"] #ageS,
-body[data-st="UNCHANGED"] #stAge{color:var(--warn)}
-body[data-st="STALE"] #ageH,
-body[data-st="STALE"] #ageM,
-body[data-st="STALE"] #ageS,
-body[data-st="STALE"] #stAge{color:var(--bad)}
-body[data-st="STALE"] .hero{box-shadow:inset 0 0 0 2px rgba(255,176,32,.38)}
-
-/* ---- secondary metrics --------------------------------------------- */
-.tiles{gap:10px}
-.tiles .head,#ageM{flex:0 0 auto}
-#vals2{display:flex;flex-direction:column;gap:10px;flex:1 1 auto;min-height:0}
-.tilegrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;flex:1 1 auto;min-height:0}
-/* hairline-separated bays, not floating mini-cards */
-.tile{
-  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;
-  border-left:1px solid var(--line);padding:4px 8px;min-width:0;
-}
-.tile:first-child{border-left:0}
-.k{
-  font-size:clamp(17px,1.8vh,18px);font-weight:700;letter-spacing:.1em;
-  text-transform:uppercase;color:var(--fg-3);white-space:nowrap;
-  overflow:hidden;text-overflow:ellipsis;max-width:100%;flex:0 0 auto;
-}
-.big{
-  font-size:clamp(30px,4.3vh,46px);font-weight:700;line-height:1.05;white-space:nowrap;
-  font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1,"lnum" 1;
-}
-/* label / bar / value read as one unit: the bar is capped instead of
-   running the full row, so the value no longer sits orphaned at the far
-   right. #mbar's % width semantics are unchanged (it fills .bar). */
-.motion{display:flex;align-items:center;gap:16px;min-width:0;flex:0 0 auto}
-.motion .k{flex:0 0 auto}
-.bar{
-  flex:0 1 min(46%,380px);min-width:120px;height:clamp(8px,1.3vh,14px);
-  background:rgba(255,255,255,.07);overflow:hidden;
-}
-#mbar{
-  display:block;height:100%;width:0%;
-  background:var(--accent);
-  transition:width var(--t) ease;
-}
-/* motion value shares the tile-value typography and right alignment */
-.motion .big{flex:0 0 auto;min-width:4ch;text-align:right}
-
-/* ---- sparkline ------------------------------------------------------ */
-.sparkcard{gap:8px}
-#spark{display:block;width:100%;flex:1 1 auto;min-height:0;height:auto}
-
-/* ---- camera + assistant -------------------------------------------- */
-.mirror{gap:10px;flex:0 0 auto}
-.mirror-row{display:flex;align-items:center;gap:12px;min-width:0;flex-wrap:wrap}
-.btn{
-  font:inherit;font-size:clamp(16px,1.6vh,16px);font-weight:700;letter-spacing:.06em;
-  padding:.55em 1em;border-radius:3px;cursor:pointer;white-space:nowrap;
-  border:1px solid var(--line-2);background:transparent;color:var(--fg);
-  transition:background var(--t) ease,border-color var(--t) ease,color var(--t) ease;
-}
-.btn:hover{background:rgba(255,255,255,.07)}
-.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-.btn.primary:hover{background:#4a92ff;border-color:#4a92ff}
-#camVideo{width:min(40%,200px);display:block;background:#000;border-radius:4px;border:1px solid var(--line-2)}
-#camCanvas{display:none}
-#camMsg{min-height:1.4em;transition:color .2s ease}
-.pres-badge{display:inline-flex;align-items:center;padding:2px 8px;font-size:11px;font-weight:700;letter-spacing:.04em;border-radius:4px;text-transform:uppercase}
-.pres-badge.idle{background:rgba(110,118,129,.15);color:#8b949e;border:1px solid #30363d}
-.pres-badge.detecting{background:rgba(210,153,34,.2);color:#e3b341;border:1px solid #d29922}
-.pres-badge.active{background:rgba(46,160,67,.2);color:#3fb950;border:1px solid #2ea043}
-.chat{gap:10px}
-.tbtn{
-  font:inherit;font-size:clamp(16px,1.6vh,16px);font-weight:700;line-height:1;
-  padding:.4em .7em;cursor:pointer;border:1px solid var(--line-2);border-radius:3px;
-  background:transparent;color:var(--fg-2);
-}
-.tbtn:hover{background:rgba(255,255,255,.07);color:var(--fg)}
-.chat .head{padding-right:44px}
-.chat .note{min-width:0;overflow:hidden;text-overflow:ellipsis}
-#chatToggle{position:absolute;top:10px;right:12px;z-index:2}
-#msgs{
-  flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;
-  padding:2px 2px 2px 0;font-size:clamp(16px,1.8vh,17px);line-height:1.5;
-  scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.2) transparent;
-}
-.m{
-  margin:0 0 10px;padding:.65em .85em;
-  border:1px solid var(--line);border-radius:6px;background:rgba(255,255,255,.025);
-  overflow-wrap:anywhere;word-break:break-word;display:flex;flex-direction:column;gap:3px;
-}
-.m.user{
-  background:rgba(47,129,247,.08);border-color:rgba(47,129,247,.28);
-  margin-left:24px;
-}
-.m.assistant{
-  background:rgba(255,255,255,.03);border-color:var(--line);
-  margin-right:24px;
-}
-.m.system{
-  background:rgba(56,139,253,.06);border-color:rgba(56,139,253,.22);
-  color:#79c0ff;font-style:italic;font-size:.9em;padding:.4em .7em;
-}
-.m-tag{
-  font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;
-  opacity:.85;margin-bottom:2px;
-}
-.m.user .m-tag{color:#58a6ff}
-.m.assistant .m-tag{color:#3fb950}
-.m-body{line-height:1.45}
-.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:currentColor;margin-right:6px;vertical-align:middle}
-.g{
-  font-size:clamp(16px,1.6vh,16px);font-weight:800;letter-spacing:.08em;
-  padding:.14em .6em;border-radius:2px;margin-left:.6em;white-space:nowrap;
-}
-.pass{background:rgba(57,229,107,.14);color:var(--ok)}
-.fail{background:rgba(255,83,71,.14);color:var(--bad)}
-#qin{display:flex;gap:8px;flex:0 0 auto;min-width:0}
-#q{
-  flex:1 1 auto;min-width:0;font:inherit;font-size:clamp(16px,1.7vh,17px);
-  padding:.55em .7em;border-radius:3px;border:1px solid var(--line-2);
-  background:rgba(0,0,0,.35);color:var(--fg);
-  transition:border-color var(--t) ease,box-shadow var(--t) ease;
-}
-#q:focus{outline:none;border-color:rgba(47,129,247,.6);box-shadow:0 0 0 3px rgba(47,129,247,.15)}
-#mic.rec{border-color:rgba(255,83,71,.55);color:var(--bad);background:rgba(255,83,71,.10)}
-/* collapsed assistant = one slim ~56px bar: last reply + input + expand.
-   The input never shrinks below its min-width (130px) and the placeholder
-   is swapped to a short "Ask…" by setChat(), so nothing truncates; the
-   right padding (64px) clears the absolutely-positioned expand chevron. */
-.chat.collapsed{flex-direction:row;align-items:center;justify-content:flex-end;
-  align-self:end;gap:10px;padding:8px 64px 8px 12px}
-.chat.collapsed .head,.chat.collapsed #msgs{display:none}
-.chat.collapsed #lastReply{display:block;flex:1 1 150px}
-.chat.collapsed #qin{flex:0 0 auto}
-.chat.collapsed #q{flex:0 0 130px;min-width:130px}
-.chat.collapsed #spk,.chat.collapsed #mic{display:none}
-#lastReply{
-  display:none;font-size:clamp(16px,1.6vh,16px);color:var(--fg-2);
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;
-}
-
-/* ---- status strip: diagnostics only, 13px floor ---------------------- */
-footer{
-  display:flex;align-items:center;justify-content:space-between;gap:16px;
-  padding:7px 24px;border-top:1px solid var(--line);
-  font-size:clamp(16px,1.6vh,17px);color:var(--fg-3);min-width:0;
-}
-.disc{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
-.diag{flex:0 0 auto;white-space:nowrap;font-variant-numeric:tabular-nums;text-align:right}
-
-@media (max-width:1180px){.tag{display:none}}
-@media (max-width:1440px){main{grid-template-columns:minmax(0,1fr) minmax(0,34%)}}
-@media (prefers-reduced-motion:reduce){*{transition:none!important}}
-</style>
-</head>
+<head><meta charset="utf-8"><title>KINETIQ Mirror</title>
+<link rel="stylesheet" href="/static/css/style.css"></head>
 <body data-st="OFFLINE">
-<!-- freshness labels state observation only: "changed Ns ago" / "first seen Ns ago" / "no data Ns" -->
-<header>
-<div class="brand"><span class="mark"></span><h1 class="wordmark">KINETIQ</h1><span class="tag">the mirror that sees and answers</span></div>
-<div class="hud">
-<div class="mode-switch" id="modeSwitch" title="Switch active source: Band 6 vs FreeRTOS">
-  <button id="btnModeBand" class="mode-btn active" onclick="setMode('band')">Band 6</button>
-  <button id="btnModeRtos" class="mode-btn rtos" onclick="setMode('rtos')">FreeRTOS</button>
-</div>
+<header><div class="brand"><span class="mark"></span><h1 class="wordmark">KINETIQ</h1><span class="tag">the mirror that sees and answers</span></div>
+<div class="hud"><div class="mode-switch" id="modeSwitch"><button id="btnModeBand" class="mode-btn active" onclick="setMode('band')">Band 6</button><button id="btnModeRtos" class="mode-btn rtos" onclick="setMode('rtos')">FreeRTOS</button></div>
 <span class="chip"><span id="lane" style="display:none">LANE</span><span class="sep" id="laneSep" style="display:none">&middot;</span><span id="src">...</span></span>
 <span class="stpill" id="stChip">OFFLINE</span>
-<span class="linkgrp"><span class="badge" id="link">LINK</span><span id="stAge">waiting for first packet</span><span id="clock">--:--:--</span></span>
-</div>
-</header>
-<main>
-<section class="col left">
-<div class="zone hero" id="heroZone">
-<div id="vals" class="dim">
-<div class="hero-top">
-<span class="eyebrow">Live vitals</span>
-<span class="act" id="activity">REST</span>
-</div>
-<div class="hero-num num"><span id="hr">--</span><span class="unit">BPM</span></div>
-</div>
-<div class="age" id="ageH">no data yet</div>
-</div>
-<div class="zone tiles">
-<div class="head"><span class="eyebrow">Secondary metrics</span><span class="age" id="ageM">no data yet</span></div>
-<div id="vals2" class="dim">
-<div class="tilegrid">
-<div class="tile"><span class="k">SpO2</span><span class="big" id="spo2">--</span></div>
-<div class="tile"><span class="k">Exertion</span><span class="big" id="ex">--</span></div>
-<div class="tile"><span class="k">Steps</span><span class="big" id="steps">--</span></div>
-<div class="tile"><span class="k">PPG</span><span class="big" id="ppg">--</span></div>
-</div>
-<div class="motion">
-<span class="k">Motion index</span>
-<span class="bar"><span id="mbar"></span></span>
-<span class="big num" id="mv">--</span>
-</div>
-</div>
-</div>
-<div class="zone sparkcard">
-<div class="head"><span class="eyebrow">Heart rate history</span><span class="age" id="ageS">no data yet</span></div>
-<canvas id="spark" width="1200" height="140"></canvas>
-</div>
-</section>
-<section class="col right">
-<div class="zone mirror" id="mirror">
-<div class="head">
-  <span class="eyebrow">The mirror sees you</span>
-  <span style="display:inline-flex;gap:6px;align-items:center">
-    <span id="presBadge" class="pres-badge idle"><span class="dot"></span>No person detected</span>
-    <span id="emoBadge" class="pres-badge idle" style="display:none"><span class="dot"></span>Mood: --</span>
-  </span>
-</div>
-<div class="mirror-row">
-<button id="camBtn" class="btn primary">Activate Camera Mirror</button>
-<video id="camVideo" autoplay playsinline muted style="display:none"></video>
-</div>
-<div class="note" id="camMsg">Click above to start mirror camera presence recognition.</div>
-<canvas id="camCanvas" width="64" height="48" style="display:none"></canvas>
-</div>
-<div class="zone chat" id="chat">
-<div class="head"><span class="eyebrow">Ask the mirror</span><span class="note">checked against live data</span></div>
-<button id="chatToggle" class="tbtn" title="Collapse assistant" aria-expanded="true" aria-label="Collapse or expand the assistant">&#9662;</button>
-<div id="msgs"><div class="m assistant"><span class="m-tag">KINETIQ</span><span class="m-body">I can see your live telemetry &mdash; ask me how you&rsquo;re doing.</span></div></div>
-<div id="lastReply" title="I can see your live telemetry &mdash; ask me how you're doing.">I can see your live telemetry &mdash; ask me how you&rsquo;re doing.</div>
-<div id="qin">
-<input id="q" placeholder="How am I doing?" autocomplete="off">
-<button id="mic" class="btn" title="Voice input (mic)">Mic</button>
-<button id="spk" class="btn primary" title="Spoken replies on/off">Voice On</button>
-<button id="send" class="btn primary">Send</button>
-</div>
-</div>
-</section>
-</main>
-<footer>
-<span class="disc">Sensors simulated &middot; camera motion only &mdash; no video stored or uploaded</span>
-<span class="diag"><span id="up">uptime --</span> &middot; <span id="rej">rejected frames --</span></span>
-</footer>
-<script>
-var hrs = [], freshLabel = 'no data yet', sw = 1, sh = 1;
-function $(id) { return document.getElementById(id); }
+<span class="linkgrp"><span class="badge" id="link">LINK</span><span id="stAge">waiting for first packet</span><span id="clock">--:--:--</span></span></div></header>
+<main><section class="col left"><div class="zone hero" id="heroZone"><div id="vals" class="dim"><div class="hero-top"><span class="eyebrow">Live vitals</span><span class="act" id="activity">REST</span></div><div class="hero-num num"><span id="hr">--</span><span class="unit">BPM</span></div></div><div class="age" id="ageH">no data yet</div></div>
+<div class="zone tiles"><div class="head"><span class="eyebrow">Secondary metrics</span><span class="age" id="ageM">no data yet</span></div><div id="vals2" class="dim"><div class="tilegrid"><div class="tile"><span class="k">SpO2</span><span class="big" id="spo2">--</span></div><div class="tile"><span class="k">Exertion</span><span class="big" id="ex">--</span></div><div class="tile"><span class="k">Steps</span><span class="big" id="steps">--</span></div><div class="tile"><span class="k">PPG</span><span class="big" id="ppg">--</span></div></div><div class="motion"><span class="k">Motion index</span><span class="bar"><span id="mbar"></span></span><span class="big num" id="mv">--</span></div></div></div>
+<div class="zone sparkcard"><div class="head"><span class="eyebrow">Heart rate history</span><span class="age" id="ageS">no data yet</span></div><canvas id="spark" width="1200" height="140"></canvas></div></section>
+<section class="col right"><div class="zone mirror" id="mirror"><div class="head"><span class="eyebrow">The mirror sees you</span><span><span id="presBadge" class="pres-badge idle"><span class="dot"></span>No person detected</span><span id="emoBadge" class="pres-badge idle" style="display:none"><span class="dot"></span>Mood: --</span></span></div><div class="mirror-row"><button id="camBtn" class="btn primary">Activate Camera Mirror</button><video id="camVideo" autoplay playsinline muted style="display:none"></video></div><div class="note" id="camMsg">Click above to start mirror camera presence recognition.</div><canvas id="camCanvas" width="64" height="48" style="display:none"></canvas></div>
+<div class="zone chat" id="chat"><div class="head"><span class="eyebrow">Ask the mirror</span><span class="note">checked against live data</span></div><button id="chatToggle" class="tbtn" aria-expanded="true">&#9662;</button><div id="msgs"><div class="m assistant"><span class="m-tag">KINETIQ</span><span class="m-body">I can see your live telemetry &mdash; ask me how you&rsquo;re doing.</span></div></div><div id="lastReply">I can see your live telemetry &mdash; ask me how you&rsquo;re doing.</div><div id="qin"><input id="q" placeholder="How am I doing?" autocomplete="off"><button id="mic" class="btn">Mic</button><button id="spk" class="btn primary">Voice On</button><button id="send" class="btn primary">Send</button></div></div></section></main>
+<footer><span class="disc" id="discText">Sensors simulated &middot; camera motion only &mdash; no video stored or uploaded</span><span class="diag"><span id="up">uptime --</span> &middot; <span id="rej">rejected frames --</span></span></footer>
+<script src="/static/js/app.js"></script>
+</body></html>"""
 
-/* ---- sparkline: heart-rate history drawn at device resolution ------- */
-function sizeSpark() {
-  var c = $('spark'), r = c.getBoundingClientRect();
-  var dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
-  sw = Math.max(1, Math.round(r.width));
-  sh = Math.max(1, Math.round(r.height));
-  c.width = Math.round(sw * dpr);
-  c.height = Math.round(sh * dpr);
-  c.getContext('2d').setTransform(dpr, 0, 0, dpr, 0, 0);
-}
-function draw() {
-  var c = $('spark'), x = c.getContext('2d');
-  x.clearRect(0, 0, sw, sh);
-  /* padding on every side keeps the series clear of the card boundary at
-     720p and 1080p alike; the left gutter carries the dimmed min/max value
-     labels so the trace reads as data, not decoration. */
-  var padY = Math.max(12, sh * 0.14), padR = Math.max(12, sw * 0.012),
-      gutter = 36, i;
-  var top = padY, base = sh - padY,
-      w = Math.max(1, sw - gutter - padR),
-      h = Math.max(1, base - top);
-  if (hrs.length < 2) {
-    x.strokeStyle = 'rgba(255,255,255,.10)';
-    x.lineWidth = 1;
-    x.setLineDash([4, 6]);
-    x.beginPath();
-    x.moveTo(gutter, sh / 2);
-    x.lineTo(sw - padR, sh / 2);
-    x.stroke();
-    x.setLineDash([]);
-    return;
-  }
-  var rawMn = Math.min.apply(null, hrs), rawMx = Math.max.apply(null, hrs);
-  var mn = rawMn, mx = rawMx;
-  if (mx - mn < 5) { mx += 2.5; mn -= 2.5; }
-  var pts = [];
-  for (i = 0; i < hrs.length; i++) {
-    pts.push([gutter + i / (hrs.length - 1) * w, top + h - (hrs[i] - mn) / (mx - mn) * h]);
-  }
-  x.strokeStyle = 'rgba(255,255,255,.10)';
-  x.lineWidth = 1;
-  x.beginPath();
-  x.moveTo(gutter, base + 0.5);
-  x.lineTo(sw - padR, base + 0.5);
-  x.stroke();
-  x.lineWidth = Math.max(1.4, h / 22);
-  x.lineJoin = 'round';
-  x.lineCap = 'round';
-  x.beginPath();
-  x.moveTo(pts[0][0], pts[0][1]);
-  for (i = 1; i < pts.length; i++) { x.lineTo(pts[i][0], pts[i][1]); }
-  var grad = x.createLinearGradient(0, top, 0, base);
-  grad.addColorStop(0, 'rgba(47,129,247,.30)');
-  grad.addColorStop(1, 'rgba(47,129,247,0)');
-  x.lineTo(gutter + w, base);
-  x.lineTo(gutter, base);
-  x.closePath();
-  x.fillStyle = grad;
-  x.fill();
-  x.beginPath();
-  x.moveTo(pts[0][0], pts[0][1]);
-  for (i = 1; i < pts.length; i++) { x.lineTo(pts[i][0], pts[i][1]); }
-  x.strokeStyle = '#2f81f7';
-  x.stroke();
-  /* min/max labels in the gutter: 16px, dimmed, values only - no
-     time-window claim. Anchored to the top/bottom gridlines. */
-  x.font = '400 16px "Segoe UI",system-ui,sans-serif';
-  x.fillStyle = 'rgba(169,180,195,.8)';
-  x.textAlign = 'right';
-  x.textBaseline = 'middle';
-  x.fillText(String(Math.round(rawMx)), gutter - 6, top);
-  x.fillText(String(Math.round(rawMn)), gutter - 6, base);
-}
 
-/* ---- nothing is projected without an age: OFFLINE blanks every number
-       instead of re-showing the last cached value as if it were current. */
-function blank() {
-  $('hr').textContent = '--';
-  $('activity').textContent = '--';
-  $('activity').className = 'act';
-  $('spo2').textContent = '--';
-  $('ex').textContent = '--';
-  $('steps').textContent = '--';
-  $('ppg').textContent = '--';
-  $('mv').textContent = '--';
-  $('mbar').style.width = '0%';
-  hrs = [];
-  draw();
-}
-function fmtUptime(s) {
-  s = Number(s || 0);
-  if (s < 60) { return s + 's'; }
-  if (s < 3600) { return Math.floor(s / 60) + 'm'; }
-  var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
-  return h + 'h' + (m < 10 ? '0' : '') + m + 'm';
-}
-function tick() {
-  fetch('/api/telemetry').then(function (r) { return r.json(); }).then(function (d) {
-    var f = d.freshness || {}, lk = d.link || {}, L = d.latest;
-    var st = f.state || 'OFFLINE';
-    freshLabel = f.label || 'no data yet';
-    /* body[data-st] drives the state styling: LIVE full white, UNCHANGED
-       amber age/pill with a full-white numeral, STALE a full-white numeral
-       plus an amber ring on the hero bay, OFFLINE the only blank/dim state. */
-    document.body.setAttribute('data-st', st);
-    var chip = $('stChip');
-    chip.textContent = st;
-    chip.className = 'stpill ' + st;
-    $('stAge').textContent = freshLabel;
-    $('ageH').textContent = freshLabel;
-    $('ageM').textContent = freshLabel;
-    $('ageS').textContent = freshLabel;
-    var lb = $('link');
-    lb.textContent = lk.label || 'LINK';
-    lb.className = 'badge ' + (lk.state === 'up' ? 'up' : 'down');
-    lb.title = lk.detail || '';
-    var lane = $('lane'), lsep = $('laneSep');
-    if (d.lane) { lane.style.display = ''; lane.textContent = d.lane; lsep.style.display = ''; }
-    else { lane.style.display = 'none'; lsep.style.display = 'none'; }
-    var s = $('src');
-    s.textContent = d.source;
-    s.className = (d.source === 'CAMERA' ? 'cam' : '');
-    $('up').textContent = 'uptime ' + fmtUptime(d.uptime_s);
-    $('rej').textContent = 'rejected frames ' + (d.rejects === undefined ? '--' : d.rejects);
-    /* STALE is still data: only OFFLINE dims the numbers. */
-    $('vals').classList.toggle('dim', st === 'OFFLINE');
-    $('vals2').classList.toggle('dim', st === 'OFFLINE');
-    if (!L) { blank(); return; }
-    var a = String(L.activity || '--').toUpperCase(), el = $('activity');
-    el.textContent = a;
-    el.className = 'act ' + (a === 'REST' ? 'rest' : (a === 'WALK' ? 'walk' : (a === 'RUN' ? 'run' : '')));
-    $('hr').textContent = L.heart_rate;
-    $('spo2').textContent = L.spo2;
-    $('ex').textContent = L.exertion;
-    $('steps').textContent = L.steps;
-    $('ppg').textContent = L.ppg_quality;
-    $('mv').textContent = Number(L.motion_intensity).toFixed(2);
-    $('mbar').style.width = (Number(L.motion_intensity) * 100) + '%';
-    hrs = d.history.slice(-60);
-    draw();
-    if (d.mode) { updateModeUI(d.mode, d.locked); }
-  });
-}
+def _is_safe_subpath(base_dir: str, target_path: str) -> bool:
+    """Return True if target_path resides inside base_dir (prevents .. traversal)."""
+    base_abs = os.path.abspath(base_dir)
+    target_abs = os.path.abspath(target_path)
+    return target_abs == base_abs or target_abs.startswith(base_abs + os.sep)
 
-function setMode(m) {
-  fetch('/api/mode', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ mode: m })
-  }).then(function (r) { return r.json(); }).then(function (d) {
-    if (d.error) { alert(d.error); }
-    updateModeUI(d.mode, d.locked);
-  }).catch(function () {});
-}
-function updateModeUI(m, locked) {
-  var bb = $('btnModeBand'), br = $('btnModeRtos');
-  if (bb && br) {
-    bb.classList.toggle('active', m === 'band');
-    br.classList.toggle('active', m === 'rtos');
-    if (locked) {
-      bb.disabled = true;
-      br.disabled = true;
-      bb.style.cursor = 'not-allowed';
-      br.style.cursor = 'not-allowed';
-      bb.style.opacity = (m === 'band' ? '1.0' : '0.4');
-      br.style.opacity = (m === 'rtos' ? '1.0' : '0.4');
-      bb.title = 'Locked: live telemetry piped from stdin';
-      br.title = 'Locked: live telemetry piped from stdin';
-    } else {
-      bb.disabled = false;
-      br.disabled = false;
-      bb.style.cursor = 'pointer';
-      br.style.cursor = 'pointer';
-      bb.style.opacity = '';
-      br.style.opacity = '';
-      bb.title = 'Switch to Huawei Band 6 mode';
-      br.title = 'Switch to FreeRTOS control mode';
-    }
-  }
-}
 
-/* ---- natural female speech synthesis (Jenny / Aria / Zira) ---- */
-var currentAudio = null;
+def _find_static_file(req_path: str) -> str | None:
+    """Resolve a requested static asset safely across static/, templates/, or web root."""
+    clean = urllib.parse.unquote(req_path.split("?", 1)[0]).replace("\\", "/").lstrip("/")
+    if not clean or ".." in clean.split("/"):
+        return None
+    if clean.startswith("static/"):
+        clean = clean[len("static/") :].lstrip("/")
+    if not clean:
+        return None
 
-function stopSpeech() {
-  if (currentAudio) {
-    try {
-      currentAudio.pause();
-      currentAudio.currentTime = 0;
-      currentAudio.src = '';
-    } catch (e) {}
-    currentAudio = null;
-  }
-  if (window.speechSynthesis) {
-    try {
-      window.speechSynthesis.cancel();
-    } catch (e) {}
-  }
-}
+    _, ext = os.path.splitext(clean)
+    ext_lower = ext.lower()
+    if ext_lower not in _ALLOWED_STATIC_EXTS:
+        return None
 
-function speakNaturalFemale(text) {
-  stopSpeech();
-  if (!window.speechSynthesis || !ttsOn) return;
-  try {
-    var clean = text.replace(/[*_#`~]/g, '').trim();
-    var u = new SpeechSynthesisUtterance(clean);
-    var voices = window.speechSynthesis.getVoices();
-    var v = voices.find(function(x) {
-      var n = x.name.toLowerCase();
-      return (n.includes('natural') || n.includes('jenny') || n.includes('aria') || n.includes('zira') || n.includes('female')) && x.lang.startsWith('en');
-    }) || voices.find(function(x) {
-      return x.lang.startsWith('en') && !x.name.toLowerCase().includes('david') && !x.name.toLowerCase().includes('george') && !x.name.toLowerCase().includes('male');
-    });
-    if (v) { u.voice = v; }
-    u.rate = 1.0;
-    u.pitch = 1.05;
-    window.speechSynthesis.speak(u);
-  } catch (e) {
-    console.error('Speech synthesis error:', e);
-  }
-}
+    basename = os.path.basename(clean)
+    rel_candidates = [clean]
+    if ext_lower == ".css" and not clean.startswith("css/"):
+        rel_candidates.append(os.path.join("css", clean))
+        rel_candidates.append(os.path.join("css", basename))
+    elif ext_lower in (".js", ".mjs") and not clean.startswith("js/"):
+        rel_candidates.append(os.path.join("js", clean))
+        rel_candidates.append(os.path.join("js", basename))
+    if basename != clean:
+        rel_candidates.append(basename)
 
-function speakAudio(text) {
-  stopSpeech();
-  if (!ttsOn || !text) return;
-  var clean = text.replace(/[*_#`~]/g, '').trim();
-  if (!clean) return;
-  try {
-    var a = new Audio('/api/tts?text=' + encodeURIComponent(clean));
-    currentAudio = a;
-    a.onended = function () {
-      if (currentAudio === a) currentAudio = null;
-    };
-    a.onerror = function () {
-      if (currentAudio === a) currentAudio = null;
-      speakNaturalFemale(clean);
-    };
-    a.play().catch(function (e) {
-      if (currentAudio === a) currentAudio = null;
-      speakNaturalFemale(clean);
-    });
-  } catch (e) {
-    speakNaturalFemale(clean);
-  }
-}
-if (window.speechSynthesis) {
-  window.speechSynthesis.onvoiceschanged = function() {
-    window.speechSynthesis.getVoices();
-  };
-}
+    search_roots = (_STATIC_DIR, _TEMPLATES_DIR, _HERE)
+    for root in search_roots:
+        if not os.path.isdir(root):
+            continue
+        for rel in rel_candidates:
+            full = os.path.abspath(os.path.join(root, rel))
+            if _is_safe_subpath(root, full) and os.path.isfile(full):
+                return full
+    return None
 
-/* ---- smart camera presence detection & greeting ---- */
-var camStream = null, camPrev = null, camEMA = 0, camSenseTimer = null, camPostTimer = null;
-var presenceSeconds = 0, autoGreetDone = false, lastGreetTimestamp = 0;
-var faceDetector = null, lastHasFace = false, personInFrame = false;
 
-if ('FaceDetector' in window) {
-  try { faceDetector = new FaceDetector({ fastMode: true, maxDetectedFaces: 1 }); } catch (e) {}
-}
+def _load_index_html() -> str:
+    """Load index.html from templates/, static/, or web root, falling back to _FALLBACK_HTML."""
+    candidates = (
+        os.path.join(_TEMPLATES_DIR, "index.html"),
+        os.path.join(_HERE, "index.html"),
+        os.path.join(_STATIC_DIR, "index.html"),
+    )
+    for path in candidates:
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    content = fh.read()
+                if content.strip():
+                    return content
+            except Exception:
+                continue
+    return _FALLBACK_HTML
 
-function updatePresenceUI(state, text, msg) {
-  var b = $('presBadge');
-  if (b) {
-    b.className = 'pres-badge ' + state;
-    b.innerHTML = text;
-  }
-  if (msg) {
-    $('camMsg').textContent = msg;
-  }
-}
 
-function checkPresenceAndGreet() {
-  var v = $('camVideo');
-  if (!v || !v.videoWidth || !camStream) {
-    presenceSeconds = 0;
-    updatePresenceUI('idle', '<span class="dot"></span>No person detected', 'Click above to activate camera mirror.');
-    return;
-  }
+# Export PAGE at module level for backwards compatibility with any test suite
+# and for runtime page patching (kinetiq-integration/mirror_band.py appends its
+# provenance chip by reassigning app.PAGE before the server starts).
+PAGE = _load_index_html()
+_PAGE_FROM_DISK = PAGE
 
-  if (personInFrame) {
-    presenceSeconds++;
-    if (presenceSeconds < 5) {
-      updatePresenceUI('detecting', '<span class="dot"></span>Person in range: ' + presenceSeconds + 's / 5s',
-                       'Person detected! Hold position in front of mirror (' + presenceSeconds + '/5s to greeting)...');
-    } else {
-      updatePresenceUI('active', '<span class="dot"></span>User Present (' + presenceSeconds + 's)',
-                       'User recognized in mirror range! Health assistant is listening.');
-      if (!autoGreetDone && (Date.now() - lastGreetTimestamp > 45000)) {
-        autoGreetDone = true;
-        lastGreetTimestamp = Date.now();
-        var m = $('msgs');
-        m.innerHTML += '<div class="m system">User detected for 5s &mdash; Spoken greeting activated!</div>';
-        m.scrollTop = m.scrollHeight;
-        sendText("Hello mirror, I just stepped in front of you. Greet me, note my live stats and how I look, and give me a quick health suggestion.", true);
-      }
-    }
-  } else {
-    if (presenceSeconds > 0) {
-      presenceSeconds = Math.max(0, presenceSeconds - 2);
-    }
-    if (presenceSeconds === 0) {
-      updatePresenceUI('idle', '<span class="dot"></span>No person detected', 'Mirror idle &mdash; Step into camera range to activate.');
-      if (autoGreetDone && (Date.now() - lastGreetTimestamp > 10000)) {
-        autoGreetDone = false; // Reset so next visitor gets greeted
-      }
-    }
-  }
-}
 
-var lastEmoPost = 0, emoBusy = false;
-function postEmotionSnapshot(force) {
-  var now = Date.now();
-  if (!camStream || emoBusy || (!force && (now - lastEmoPost < 3500))) { return; }
-  var v = $('camVideo');
-  if (!v || !v.videoWidth) { return; }
-  lastEmoPost = now;
-  emoBusy = true;
-  try {
-    var c = document.createElement('canvas');
-    c.width = 320;
-    c.height = 240;
-    var ctx = c.getContext('2d');
-    ctx.drawImage(v, 0, 0, 320, 240);
-    var dataUrl = c.toDataURL('image/jpeg', 0.6);
-    fetch('/api/emotion', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image: dataUrl, person: personInFrame })
-    }).then(function (r) { return r.json(); }).then(function (d) {
-      emoBusy = false;
-      var eb = $('emoBadge');
-      if (eb) {
-        if (!personInFrame) {
-          eb.className = 'pres-badge idle';
-          eb.innerHTML = '<span class="dot"></span>Mood: --';
-        } else if (d && d.vision && d.vision.label) {
-          eb.style.display = 'inline-flex';
-          var raw = d.vision.raw_emotion;
-          var cls = (raw === 'Anger' || raw === 'Fear' || raw === 'Sadness') ? 'detecting' : 'active';
-          eb.className = 'pres-badge ' + cls;
-          eb.innerHTML = '<span class="dot"></span>Mood: ' + d.vision.label;
-        }
-      }
-    }).catch(function () { emoBusy = false; });
-  } catch (e) { emoBusy = false; }
-}
+def _served_page() -> str:
+    """Serve the on-disk template, unless an integration replaced PAGE at runtime.
 
-function camStop(silent) {
-  if (camSenseTimer) { clearInterval(camSenseTimer); camSenseTimer = null; }
-  if (camPostTimer) { clearInterval(camPostTimer); camPostTimer = null; }
-  if (camStream) { camStream.getTracks().forEach(function (t) { t.stop(); }); camStream = null; }
-  camPrev = null;
-  presenceSeconds = 0;
-  autoGreetDone = false;
-  personInFrame = false;
-  var v = $('camVideo');
-  v.removeAttribute('srcObject');
-  v.srcObject = null;
-  v.style.display = 'none';
-  $('camBtn').textContent = 'Activate Camera Mirror';
-  updatePresenceUI('idle', '<span class="dot"></span>No person detected', 'Click above to activate camera mirror.');
-  var eb = $('emoBadge');
-  if (eb) { eb.style.display = 'none'; eb.className = 'pres-badge idle'; eb.innerHTML = '<span class="dot"></span>Mood: --'; }
-}
+    mirror_band.py does ``app.PAGE = inject_chip(app.PAGE)``; identity comparison
+    detects that patch without breaking live edits to templates/index.html.
+    """
+    if PAGE is not _PAGE_FROM_DISK:
+        return PAGE
+    return _load_index_html()
 
-function camFrame() {
-  var v = $('camVideo');
-  if (!v || !v.videoWidth) { return; }
 
-  // 1. Check native face detection if supported by browser
-  if (faceDetector) {
-    faceDetector.detect(v).then(function (faces) {
-      lastHasFace = faces.length > 0;
-    }).catch(function () {});
-  }
-
-  // 2. Downsampled 64x48 canvas for central mirror-zone presence & motion
-  var c = $('camCanvas'), x = c.getContext('2d');
-  x.drawImage(v, 0, 0, 64, 48);
-  var d = x.getImageData(0, 0, 64, 48).data, g = [], i;
-  for (i = 0; i < d.length; i += 4) { g.push((d[i] + d[i + 1] + d[i + 2]) / 3); }
-
-  if (camPrev) {
-    var totalDiff = 0, centerDiff = 0, centerCount = 0;
-    for (var y = 0; y < 48; y++) {
-      for (var col = 0; col < 64; col++) {
-        var idx = y * 64 + col;
-        var diff = Math.abs(g[idx] - camPrev[idx]);
-        totalDiff += diff;
-        // Central 50% region (mirror presence zone: y: 10..38, col: 14..50)
-        if (y >= 10 && y <= 38 && col >= 14 && col <= 50) {
-          centerDiff += diff;
-          centerCount++;
-        }
-      }
-    }
-    var raw = (totalDiff / g.length) / 255.0;
-    var centerRaw = (centerDiff / (centerCount || 1)) / 255.0;
-    camEMA = camEMA + 0.3 * (raw - camEMA);
-
-    // Person is present if:
-    // a) Face detected by Chromium API, OR
-    // b) Center motion is above the noise floor (human breathing/micro-motion > 0.010), OR
-    // c) Overall motion is active (> 0.014)
-    personInFrame = lastHasFace || (centerRaw >= 0.010) || (raw >= 0.014);
-  }
-  camPrev = g;
-}
-
-function camPost() {
-  fetch('/api/camera_ingest', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ motion: camEMA, activity: 'auto' })
-  }).catch(function () {});
-  postEmotionSnapshot(false);
-  checkPresenceAndGreet();
-}
-
-$('camBtn').onclick = function () {
-  if (camStream) { camStop(); return; }
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    $('camMsg').textContent = 'No camera in this browser — staying on mock engine.';
-    return;
-  }
-  var btn = this;
-  navigator.mediaDevices.getUserMedia({ video: true }).then(function (stream) {
-    camStream = stream;
-    camEMA = 0;
-    camPrev = null;
-    presenceSeconds = 0;
-    var v = $('camVideo');
-    v.srcObject = stream;
-    v.style.display = 'block';
-    btn.textContent = 'Stop Camera';
-    updatePresenceUI('idle', '<span class="dot"></span>Scanning...', 'Camera live — stand in front of mirror.');
-    var eb = $('emoBadge');
-    if (eb) { eb.style.display = 'inline-flex'; eb.className = 'pres-badge idle'; eb.innerHTML = '<span class="dot"></span>Mood: Scanning...'; }
-    camSenseTimer = setInterval(camFrame, 250);
-    camPostTimer = setInterval(camPost, 1000);
-  }).catch(function () {
-    $('camMsg').textContent = 'Camera blocked — allow camera permission in browser.';
-  });
-};
-
-setInterval(function () { $('clock').textContent = new Date().toLocaleTimeString(); }, 1000);
-
-/* ---- assistant ------------------------------------------------------ */
-var ttsOn = true, recorder = null, chunks = [], recTimer = null, chatOpen = true;
-function send() { var i = $('q'); sendText(i.value.trim()); i.value = ''; }
-function sendText(q, isAuto) {
-  if (!q) { return; }
-  stopSpeech();
-  postEmotionSnapshot(true);
-  var m = $('msgs');
-  if (!isAuto) {
-    m.innerHTML += '<div class="m user"><span class="m-tag">YOU</span><span class="m-body">' + q.replace(/</g, '&lt;') + '</span></div>';
-    m.scrollTop = m.scrollHeight;
-  }
-  var useBackendTTS = !('speechSynthesis' in window) && ttsOn;
-  fetch('/api/ask', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ q: q, tts: useBackendTTS })
-  }).then(function (r) { return r.json(); }).then(function (d) {
-    var g = d.grounding || 'FAIL', cls = g === 'PASS' ? 'pass' : 'fail';
-    var reply = (d.answer || d.error || '?');
-    m.innerHTML += '<div class="m assistant"><span class="m-tag">KINETIQ</span><span class="m-body">' + (reply.replace(/</g, '&lt;'))
-      + '<span class="g ' + cls + '">' + g + '</span>'
-      + '<span class="age" style="display:inline;margin-left:8px">' + freshLabel + '</span></span></div>';
-    m.scrollTop = m.scrollHeight;
-    var lr = $('lastReply');
-    lr.textContent = reply;
-    lr.title = reply;
-    if (ttsOn && d.answer) {
-      speakAudio(d.answer);
-    }
-  });
-}
-/* collapse toggle: collapsed = slim ~56px bar (last reply + input),
-   expanded = full transcript. Page never scrolls either way. */
-function setChat(open) {
-  chatOpen = open;
-  $('chat').classList.toggle('collapsed', !open);
-  /* collapsed bar is narrow: a short placeholder keeps it un-truncated */
-  $('q').placeholder = open ? 'How am I doing?' : 'Ask\u2026';
-  var b = $('chatToggle');
-  b.innerHTML = open ? '&#9662;' : '&#9652;';
-  b.title = open ? 'Collapse assistant' : 'Expand assistant';
-  b.setAttribute('aria-expanded', open ? 'true' : 'false');
-  if (open) { var m = $('msgs'); m.scrollTop = m.scrollHeight; }
-}
-$('chatToggle').onclick = function () { setChat(!chatOpen); };
-$('spk').onclick = function () {
-  ttsOn = !ttsOn;
-  if (!ttsOn) { stopSpeech(); }
-  this.textContent = ttsOn ? 'Voice On' : 'Voice Muted';
-  this.classList.toggle('primary', ttsOn);
-};
-function micHint(t) {
-  var m = $('msgs');
-  m.innerHTML += '<div class="m system">' + t + ' &mdash; type instead, text chat keeps working.</div>';
-  m.scrollTop = m.scrollHeight;
-}
-function stopMic() {
-  if (recTimer) { clearTimeout(recTimer); recTimer = null; }
-  if (recorder && recorder.state !== 'inactive') { try { recorder.stop(); } catch (e) {} }
-  var b = $('mic');
-  b.classList.remove('rec');
-  b.textContent = 'Mic';
-}
-$('mic').onclick = function () {
-  stopSpeech();
-  if (recorder && recorder.state !== 'inactive') { stopMic(); return; }
-  if (!window.MediaRecorder || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    micHint('no microphone in this browser');
-    return;
-  }
-  var btn = this;
-  navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
-    stopSpeech();
-    chunks = [];
-    try { recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' }); }
-    catch (e) { recorder = new MediaRecorder(stream); }
-    recorder.ondataavailable = function (e) { if (e.data && e.data.size) { chunks.push(e.data); } };
-    recorder.onstop = function () {
-      stream.getTracks().forEach(function (t) { t.stop(); });
-      if (!chunks.length) { micHint('heard nothing, try again'); return; }
-      var blob = new Blob(chunks, { type: 'audio/webm' }), m = $('msgs');
-      var statusId = 'status_' + Date.now();
-      m.innerHTML += '<div class="m system" id="' + statusId + '">Transcribing voice input\u2026</div>';
-      m.scrollTop = m.scrollHeight;
-      fetch('/api/transcribe', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: blob
-      }).then(function (r) { return r.json(); }).then(function (d) {
-        var statusEl = $(statusId);
-        if (statusEl) { statusEl.remove(); }
-        if (d.text) {
-          sendText(d.text);
-        } else {
-          micHint('could not hear that (' + (d.error || '?') + ')');
-        }
-      }).catch(function () {
-        var statusEl = $(statusId);
-        if (statusEl) { statusEl.remove(); }
-        micHint('transcription failed');
-      });
-    };
-    recorder.start();
-    btn.classList.add('rec');
-    btn.textContent = 'Listening...';
-    recTimer = setTimeout(stopMic, 10000);
-  }).catch(function () { micHint('mic blocked — allow microphone permission, or type instead'); });
-};
-$('send').onclick = send;
-$('q').onkeydown = function (e) { if (e.key === 'Enter') { send(); } };
-
-sizeSpark();
-setInterval(tick, 1000);
-tick();
-window.addEventListener('resize', function () { sizeSpark(); draw(); });
-</script>
-</body>
-</html>
-"""
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-    def _send(self, code, body, ctype):
+    def _send(self, code: int, body: str | bytes, ctype: str, head_only: bool = False):
         data = body.encode("utf-8") if isinstance(body, str) else body
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
 
-    def do_GET(self):
-        if self.path.split("?")[0] == "/api/telemetry":
+    def _send_file(self, file_path: str, head_only: bool = False):
+        try:
+            with open(file_path, "rb") as fh:
+                data = fh.read()
+            _, ext = os.path.splitext(file_path)
+            ext_lower = ext.lower()
+            ctype = _MIME_OVERRIDES.get(ext_lower)
+            if not ctype:
+                guessed, _ = mimetypes.guess_type(file_path)
+                ctype = guessed or "application/octet-stream"
+                if ctype.startswith("text/") and "charset=" not in ctype:
+                    ctype += "; charset=utf-8"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except Exception as exc:
+            self._send(
+                500,
+                json.dumps({"error": str(exc)}),
+                "application/json",
+                head_only=head_only,
+            )
+
+    def _handle_get_or_head(self, head_only: bool = False):
+        path = self.path.split("?", 1)[0]
+        if path == "/api/telemetry":
             with _lock:
                 latest = dict(_latest) if _latest else None
                 hist = [p["heart_rate"] for p in _history]
                 rej = _rejects
-            body = {"latest": latest, "history": hist, "source": _current_source(),
-                    "rejects": rej, "uptime_s": int(time.monotonic() - _start_t),
-                    "freshness": _freshness(), "link": _link(),
-                    "lane": _current_lane_label(), "mode": _ACTIVE_MODE,
-                    "locked": STDIN_MODE}
-            self._send(200, json.dumps(body), "application/json")
-        elif self.path.split("?")[0] == "/api/mode":
-            self._send(200, json.dumps({"mode": _ACTIVE_MODE, "lane": _current_lane_label(), "locked": STDIN_MODE}), "application/json")
-        elif self.path.split("?")[0] == "/api/tts":
+            body = {
+                "latest": latest,
+                "history": hist,
+                "source": _current_source(),
+                "rejects": rej,
+                "uptime_s": int(time.monotonic() - _start_t),
+                "freshness": _freshness(),
+                "link": _link(),
+                "lane": _current_lane_label(),
+                "mode": _ACTIVE_MODE,
+                "locked": STDIN_MODE,
+            }
+            self._send(200, json.dumps(body), "application/json", head_only=head_only)
+            return
+
+        if path == "/api/mode":
+            self._send(
+                200,
+                json.dumps(
+                    {
+                        "mode": _ACTIVE_MODE,
+                        "lane": _current_lane_label(),
+                        "locked": STDIN_MODE,
+                    }
+                ),
+                "application/json",
+                head_only=head_only,
+            )
+            return
+
+        if path in ("/api/health", "/api/status"):
+            with _lock:
+                arr = _fresh.get("arrivals", 0)
+                rej = _rejects
+            health = {
+                "ok": True,
+                "mode": _ACTIVE_MODE,
+                "lane": _current_lane_label(),
+                "source": _current_source(),
+                "locked": STDIN_MODE,
+                "arrivals": arr,
+                "rejects": rej,
+                "uptime_s": int(time.monotonic() - _start_t),
+                "freshness": _freshness(),
+                "link": _link(),
+            }
+            self._send(200, json.dumps(health), "application/json", head_only=head_only)
+            return
+
+        if path == "/api/tts":
             query_str = self.path.split("?", 1)[1] if "?" in self.path else ""
-            import urllib.parse
             params = urllib.parse.parse_qs(query_str)
             text = params.get("text", [""])[0]
             if not text:
-                self._send(400, '{"error":"missing text"}', "application/json")
+                self._send(
+                    400,
+                    '{"error":"missing text"}',
+                    "application/json",
+                    head_only=head_only,
+                )
                 return
             audio_data = synthesize_neural_tts(text)
             if audio_data:
-                self._send(200, audio_data, "audio/mpeg")
+                self._send(200, audio_data, "audio/mpeg", head_only=head_only)
             else:
-                self._send(503, '{"error":"neural tts unavailable"}', "application/json")
-        elif self.path.split("?")[0] == "/api/emotion":
+                self._send(
+                    503,
+                    '{"error":"neural tts unavailable"}',
+                    "application/json",
+                    head_only=head_only,
+                )
+            return
+
+        if path == "/api/emotion":
             with _VISION_LOCK:
-                self._send(200, json.dumps(_MIRROR_VISION), "application/json")
-        elif self.path.split("?")[0] in ("/", "/index.html"):
-            self._send(200, PAGE, "text/html; charset=utf-8")
-        else:
-            self._send(404, '{"error":"not found"}', "application/json")
+                self._send(
+                    200,
+                    json.dumps(_MIRROR_VISION),
+                    "application/json",
+                    head_only=head_only,
+                )
+            return
+
+        if path in ("/", "/index.html"):
+            self._send(
+                200,
+                _served_page(),
+                "text/html; charset=utf-8",
+                head_only=head_only,
+            )
+            return
+
+        static_file = _find_static_file(path)
+        if static_file:
+            self._send_file(static_file, head_only=head_only)
+            return
+
+        if path == "/favicon.ico":
+            self._send(200, _FAVICON_SVG, "image/svg+xml", head_only=head_only)
+            return
+
+        self._send(
+            404,
+            '{"error":"not found"}',
+            "application/json",
+            head_only=head_only,
+        )
+
+    def do_GET(self):
+        self._handle_get_or_head(head_only=False)
+
+    def do_HEAD(self):
+        self._handle_get_or_head(head_only=True)
 
     def do_POST(self):
-        path = self.path.split("?")[0]
+        global _rejects
+        path = self.path.split("?", 1)[0]
+
+        if path in ("/api/ingest", "/api/telemetry"):
+            try:
+                nbytes = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(nbytes) if nbytes > 0 else b"{}"
+                payload_str = raw.decode("utf-8") or "{}"
+                rec = TelemetryRecord.parse(payload_str)
+                _store(rec.to_dict())
+                self._send(
+                    200,
+                    json.dumps({"ok": True, "freshness": _freshness()["state"]}),
+                    "application/json",
+                )
+            except Exception as exc:
+                with _lock:
+                    _rejects += 1
+                self._send(
+                    400,
+                    json.dumps({"ok": False, "error": str(exc)}),
+                    "application/json",
+                )
+            return
+
         if path == "/api/emotion":
             try:
                 nbytes = int(self.headers.get("Content-Length") or 0)
@@ -1805,20 +1325,32 @@ class Handler(BaseHTTPRequestHandler):
                     res = det.detect_from_base64(img_data)
                 with _VISION_LOCK:
                     _MIRROR_VISION.update(res)
-                self._send(200, json.dumps({"status": "ok", "vision": res}), "application/json")
+                self._send(
+                    200,
+                    json.dumps({"status": "ok", "vision": res}),
+                    "application/json",
+                )
             except Exception as exc:
                 self._send(500, json.dumps({"error": str(exc)}), "application/json")
             return
+
         if path == "/api/mode":
-            global _ACTIVE_MODE
+            global _ACTIVE_MODE, LANE_LABEL
             if STDIN_MODE:
-                self._send(409, json.dumps({
-                    "ok": False,
-                    "error": "Mode is locked: incoming telemetry is piped directly from stdin (%s)" % (LANE or "stdin"),
-                    "mode": _ACTIVE_MODE,
-                    "lane": _current_lane_label(),
-                    "locked": True
-                }), "application/json")
+                self._send(
+                    409,
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": "Mode is locked: incoming telemetry is piped directly from stdin (%s)"
+                            % (LANE or "stdin"),
+                            "mode": _ACTIVE_MODE,
+                            "lane": _current_lane_label(),
+                            "locked": True,
+                        }
+                    ),
+                    "application/json",
+                )
                 return
             try:
                 nbytes = int(self.headers.get("Content-Length") or 0)
@@ -1826,18 +1358,43 @@ class Handler(BaseHTTPRequestHandler):
                 data = json.loads(raw.decode("utf-8") or "{}")
                 m = str(data.get("mode", "")).lower().strip()
                 if m in ("band", "rtos"):
+                    changed = False
                     with _lock:
-                        _ACTIVE_MODE = m
-                    self._send(200, json.dumps({"ok": True, "mode": _ACTIVE_MODE, "lane": _current_lane_label(), "locked": False}), "application/json")
+                        if _ACTIVE_MODE != m:
+                            _ACTIVE_MODE = m
+                            LANE_LABEL = _current_lane_label()
+                            changed = True
+                    if changed:
+                        _reset_telemetry_state()
+                    self._send(
+                        200,
+                        json.dumps(
+                            {
+                                "ok": True,
+                                "mode": _ACTIVE_MODE,
+                                "lane": _current_lane_label(),
+                                "locked": False,
+                            }
+                        ),
+                        "application/json",
+                    )
                     return
-                self._send(400, json.dumps({"error": "invalid mode (band or rtos)"}), "application/json")
+                self._send(
+                    400,
+                    json.dumps({"error": "invalid mode (band or rtos)"}),
+                    "application/json",
+                )
             except Exception as exc:
                 self._send(500, json.dumps({"error": str(exc)}), "application/json")
             return
+
         if path == "/api/camera_ingest":
             if STDIN_MODE:
-                self._send(409, json.dumps({"error": "stdin mode ignores camera"}),
-                           "application/json")
+                self._send(
+                    409,
+                    json.dumps({"error": "stdin mode ignores camera"}),
+                    "application/json",
+                )
                 return
             try:
                 nbytes = int(self.headers.get("Content-Length") or 0)
@@ -1847,14 +1404,14 @@ class Handler(BaseHTTPRequestHandler):
                 raw = self.rfile.read(nbytes) if nbytes > 0 else b"{}"
                 data = json.loads(raw.decode("utf-8") or "{}")
             except Exception:
-                self._send(400, json.dumps({"error": "bad JSON"}),
-                           "application/json")
+                self._send(400, json.dumps({"error": "bad JSON"}), "application/json")
                 return
             try:
                 motion = float(data.get("motion", 0.0))
             except Exception:
-                self._send(400, json.dumps({"error": "bad motion"}),
-                           "application/json")
+                self._send(
+                    400, json.dumps({"error": "bad motion"}), "application/json"
+                )
                 return
             motion = min(2.0, max(0.0, motion))
             now = time.monotonic()
@@ -1862,45 +1419,62 @@ class Handler(BaseHTTPRequestHandler):
                 _cam["motion"] = motion
                 _cam["ts"] = now
             band = _cam_band_update(motion, now)
-            self._send(200, json.dumps({"ok": True, "band": band,
-                                        "source": _current_source(now)}),
-                       "application/json")
+            self._send(
+                200,
+                json.dumps(
+                    {"ok": True, "band": band, "source": _current_source(now)}
+                ),
+                "application/json",
+            )
             return
+
         if path == "/api/transcribe":
             try:
                 nbytes = int(self.headers.get("Content-Length") or 0)
             except Exception:
                 nbytes = 0
             if nbytes <= 0:
-                self._send(400, json.dumps({"error": "empty audio upload"}),
-                           "application/json")
+                self._send(
+                    400,
+                    json.dumps({"error": "empty audio upload"}),
+                    "application/json",
+                )
                 return
             if nbytes > MAX_AUDIO_BYTES:
-                self._send(413, json.dumps({"error": "audio too large (cap ~1 MB)"}),
-                           "application/json")
+                self._send(
+                    413,
+                    json.dumps({"error": "audio too large (cap ~2 MB)"}),
+                    "application/json",
+                )
                 return
             try:
                 raw = self.rfile.read(nbytes)
             except Exception as exc:  # noqa
-                self._send(400, json.dumps({"error": "unreadable upload: %s" % exc}),
-                           "application/json")
+                self._send(
+                    400,
+                    json.dumps({"error": "unreadable upload: %s" % exc}),
+                    "application/json",
+                )
                 return
             try:
                 text = transcribe_audio_bytes(raw, timeout_s=15.0)
             except TimeoutError as exc:
-                self._send(504, json.dumps({"error": str(exc)}),
-                           "application/json")
+                self._send(504, json.dumps({"error": str(exc)}), "application/json")
                 return
             except Exception as exc:  # noqa - clean JSON errors, never crash
-                self._send(500, json.dumps(
-                    {"error": "%s: %s" % (type(exc).__name__, exc)}),
-                    "application/json")
+                self._send(
+                    500,
+                    json.dumps({"error": "%s: %s" % (type(exc).__name__, exc)}),
+                    "application/json",
+                )
                 return
             self._send(200, json.dumps({"text": text}), "application/json")
             return
-        if self.path.split("?")[0] != "/api/ask":
+
+        if path != "/api/ask":
             self._send(404, '{"error":"not found"}', "application/json")
             return
+
         try:
             nbytes = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(nbytes) if nbytes > 0 else b"{}"
@@ -1910,19 +1484,21 @@ class Handler(BaseHTTPRequestHandler):
                 data = {}
             q = str(data.get("q", "") or "")
             if not q.strip():
-                self._send(400, json.dumps({"error": "missing 'q'"}),
-                            "application/json")
+                self._send(
+                    400, json.dumps({"error": "missing 'q'"}), "application/json"
+                )
                 return
             try:
                 answer, grounding = ask_question(q)
             except TimeoutError as exc:
-                self._send(504, json.dumps({"error": str(exc)}),
-                            "application/json")
+                self._send(504, json.dumps({"error": str(exc)}), "application/json")
                 return
             except Exception as exc:  # noqa - never crash the server
-                self._send(500, json.dumps(
-                    {"error": "%s: %s" % (type(exc).__name__, exc)}),
-                    "application/json")
+                self._send(
+                    500,
+                    json.dumps({"error": "%s: %s" % (type(exc).__name__, exc)}),
+                    "application/json",
+                )
                 return
             try:
                 # Speaker toggle: frontend sends {"tts": false} to mute speech.
@@ -1931,13 +1507,14 @@ class Handler(BaseHTTPRequestHandler):
                     _speak_async(answer)
             except Exception:  # noqa - TTS failure never breaks the API
                 pass
-            self._send(200, json.dumps({"answer": answer,
-                                        "grounding": grounding}),
-                       "application/json")
+            self._send(
+                200,
+                json.dumps({"answer": answer, "grounding": grounding}),
+                "application/json",
+            )
         except Exception as exc:  # noqa
             try:
-                self._send(500, json.dumps({"error": str(exc)}),
-                            "application/json")
+                self._send(500, json.dumps({"error": str(exc)}), "application/json")
             except Exception:  # noqa
                 pass
 
@@ -1958,7 +1535,7 @@ def main():
     srv = None
     for port in (8777, 8778):
         try:
-            srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+            srv = ReusableThreadingHTTPServer(("127.0.0.1", port), Handler)
             break
         except OSError:
             srv = None
@@ -1966,8 +1543,11 @@ def main():
         print("error: ports 8777 and 8778 are busy", file=sys.stderr)
         return 1
     url = "http://127.0.0.1:%d/" % port
-    print("KINETIQ WEB dashboard: %s  (source=%s%s)"
-          % (url, _source, ", lane=%s" % LANE if LANE_LABEL else ""), flush=True)
+    print(
+        "KINETIQ WEB dashboard: %s  (source=%s%s)"
+        % (url, _source, ", lane=%s" % LANE if LANE else ""),
+        flush=True,
+    )
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

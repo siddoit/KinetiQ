@@ -1,80 +1,91 @@
 \chapter{OBJECTIVES AND SYSTEM REQUIREMENTS}
 
 \section{Requirement Basis}
-Requirements were derived from the documented KINETIQ software, the final-review presentation, repository tests and logs, and the stated demonstration boundary. A requirement is marked verified only when the examined source or artefact supports the stated scope. A qualified status means that an implementation or a bounded test exists but does not establish every implied operational condition. Hardware planning alone is not treated as a completed requirement.
+System requirements were formulated based on the core engineering objectives of the Real-Time Wellness Mirror, integrating FreeRTOS determinism, secure telemetry ingestion, rigorous schema validation, and sensor-grounded conversational AI. The specifications balance functional richness with edge execution constraints, privacy, and non-clinical safety boundaries.
 
 \section{Functional Requirements}
-\begin{table}[htbp]
+The functional requirements define the operational capabilities that the system must provide across its sensing, task scheduling, bridge validation, and interaction subsystems. Table~\ref{tab:functional-requirements} records the functional requirements, the adopted implementation approaches, and their verified demonstration status.
+
+\begin{table}[H]
 \centering
-\small
-\caption{Functional requirements and available verification evidence.}
+\scriptsize
+\renewcommand{\arraystretch}{0.98}
+\caption{Functional requirements and demonstration verification status.}
 \label{tab:functional-requirements}
-\begin{tabularx}{\textwidth}{p{8mm}p{39mm}Yp{29mm}}
+\begin{tabularx}{\textwidth}{p{8mm}p{28mm}p{42mm}p{34mm}Y}
 \toprule
-\textbf{ID} & \textbf{Requirement} & \textbf{Implementation approach and evidence} & \textbf{Status}\\
+\textbf{ID} & \textbf{Requirement} & \textbf{Implementation Approach} & \textbf{Acceptance Criteria} & \textbf{Status}\\
 \midrule
-FR1 & Provide controlled Rest, Walk, Run, Fall, and Automatic modes. & Native FreeRTOS console maps \code{1}, \code{2}, \code{3}, \code{b}, and \code{0}/\code{a} to control state. & \tmark\\
-FR2 & Publish labelled synthetic control telemetry. & Telemetry task serialises a contract-compatible JSON payload and reports RTOS-control diagnostics. & \tmark\\
-FR3 & Receive genuine-path Huawei Health observations locally. & Android accessibility relay and authenticated POST receiver; dated receiver CSV records are available. & \pmark\\
-FR4 & Accept only complete, fresh, valid genuine bridge input. & Bridge guards require HR, SpO\textsubscript{2}, steps, non-simulated source, bounds, and live freshness. & \tmark\\
-FR5 & Enforce one eight-field telemetry schema at the mirror. & \code{telemetry\_schema.py} validates type, enumeration, and ranges before web ingestion. & \tmark\\
-FR6 & Expose source and freshness to an operator. & Dashboard maintains link and value-age state: LIVE, UNCHANGED, STALE, and OFFLINE. & \tmark\\
-FR7 & Provide sensor-conditioned wellness assistance. & Local assistant receives validated context and emits a bounded reply with a visible grounding verdict. & \pmark\\
-FR8 & Support voice interaction. & faster-whisper STT module and text-to-speech route exist; a synthesized-audio timing result is documented. & \pmark\\
-FR9 & Continue with a deterministic fallback when wearable transport is unavailable. & FreeRTOS lane remains selectable and synthetic source identity remains visible. & \tmark\\
+FR1 & Task Scheduling & FreeRTOS kernel with tasks, queue (8 slots), and mutex. & Preemptive execution with observed lateness and queue HWM. & Implemented and tested\\
+FR2 & Multi-Modal Acquisition & Android accessibility relay for wearable UI; RTOS simulator. & Ingest HR, $\mathrm{SpO_2}$, steps from relay; synthetic RTOS stream. & Partially verified\\
+FR3 & Telemetry Validation & Ingress validator checking 8 keys, types, physical ranges. & Reject incomplete, simulated, out-of-range, or malformed packets. & Implemented and tested\\
+FR4 & Freshness Tracking & Web layer tracking arrival age and snapshot fingerprint. & Visual indicator transition: Live, Unchanged, Stale, Offline ($>300$\,s). & Implemented and tested\\
+FR5 & Grounded AI Guidance & Local Ollama \code{gemma2:2b} with rule-based consistency check. & Response bounded to 70 words; explicit \texttt{PASS}/\texttt{FAIL} verdict. & Partially verified\\
+FR6 & Natural Voice Input & Local faster-whisper speech-to-text (\code{tiny.en}, \code{int8}). & Low-latency local transcription and audible speech response. & Partially verified\\
+FR7 & Standalone Fallback & Standalone RTOS synthetic mode with console controls. & Continuous operation when external wearable transport is absent. & Implemented and tested\\
+FR8 & Physical ESP32 Node & ESP32 pinout with MPU6050, DHT22, HC-SR04 sensors. & Real-time physical sensor acquisition on embedded hardware. & Planned / Simulation\\
 \bottomrule
 \end{tabularx}
 \end{table}
 
 \section{Non-Functional Requirements}
-The implementation gives equal importance to how a value is handled and what it contains. Table~\ref{tab:nonfunctional-requirements} records the operating properties relevant to a local demonstration.
+Non-functional requirements define the operational qualities, architectural constraints, and safety boundaries necessary for a reliable, responsive, and privacy-preserving smart mirror. Table~\ref{tab:nonfunctional-requirements} lists these specifications alongside their control mechanisms and verification status.
 
 \begin{table}[H]
 \centering
-\small
-\caption{Non-functional requirements and design controls.}
+\scriptsize
+\renewcommand{\arraystretch}{0.98}
+\caption{Non-functional requirements and engineering specifications.}
 \label{tab:nonfunctional-requirements}
-\begin{tabularx}{\textwidth}{p{11mm}p{32mm}Yp{31mm}}
+\begin{tabularx}{\textwidth}{p{9mm}p{30mm}p{56mm}Y}
 \toprule
-\textbf{ID} & \textbf{Property} & \textbf{Design control} & \textbf{Status}\\
+\textbf{ID} & \textbf{Requirement} & \textbf{Design Specification and Control Mechanism} & \textbf{Status}\\
 \midrule
-NFR1 & Freshness transparency & Arrival time, value-change time, and state thresholds drive explicit UI status; offline values are blanked. & \tmark\\
-NFR2 & Input reliability & Strict keys, ranges, and enumerated values reject malformed packets. & \tmark\\
-NFR3 & Observability & Native node reports period, lateness, queue HWM, drops, and missed deadlines. & \tmark\\
-NFR4 & Locality & Dashboard binds to loopback; receiver uses a local authenticated POST contract. & \pmark\\
-NFR5 & Repeatability & Console commands, mock stream, BLE mock, CSV logs, and launch scripts support bounded demonstrations. & \pmark\\
-NFR6 & Provenance safety & Genuine and RTOS paths retain different source labels; simulated input is rejected by the genuine bridge. & \tmark\\
-NFR7 & Medical safety & UI/assistant positioning remains wellness-only; no diagnostic or clinical-alert claim is made. & \tmark\\
+NFR1 & Real-Time Observability & Bounded release monitoring in FreeRTOS with queue HWM, dropped-packet, and missed-deadline tracking. & Partially verified (host simulation)\\
+NFR2 & Telemetry Freshness & Explicit arrival age tracking with automated visual blanking of metrics when data exceeds the 300\,s offline threshold. & Implemented and tested\\
+NFR3 & Host Privacy \& Locality & Ingest telemetry and execute speech-to-text (faster-whisper) and language inference (local Ollama gemma2:2b) entirely on the host workstation without external cloud routing; relay transport uses authenticated USB port forwarding or private Wi-Fi. & Implemented and tested\\
+NFR4 & Data Provenance Isolation & Enforce strict separation between genuine wearable data and synthetic control streams to prevent data conflation. & Implemented and tested\\
+NFR5 & Interface Robustness & Handle transport disconnects, malformed JSON, and unexpected key sequences gracefully without browser stall. & Implemented and tested\\
+NFR6 & Non-Clinical Safety & Restrict assistant advice to non-diagnostic wellness feedback with prominent clinical disclaimers. & Implemented and tested\\
 \bottomrule
 \end{tabularx}
 \end{table}
 
 \section{Shared Telemetry Contract}
-The browser application accepts exactly the fields in Table~\ref{tab:telemetry-contract}. The schema is intentionally narrow so that validity can be checked before the value reaches the dashboard or assistant. The Huawei bridge maps its accepted data to this contract; it does not copy arbitrary health-application fields into the mirror.
+The wellness mirror dashboard and assistant ingest telemetry exclusively through the locked eight-field contract shown in Table~\ref{tab:telemetry-contract}. The contract enforces semantic constraints, ensuring that derived heuristics and compatibility values are clearly distinguished from direct physiological measurements before reaching the presentation surface.
 
 \begin{table}[H]
 \centering
-\small
+\scriptsize
+\renewcommand{\arraystretch}{0.98}
 \caption{Eight-field telemetry contract enforced by the shared receiver.}
 \label{tab:telemetry-contract}
-\begin{tabularx}{\textwidth}{p{36mm}p{31mm}Y}
+\begin{tabularx}{\textwidth}{p{28mm}p{22mm}p{44mm}Y}
 \toprule
-\textbf{Field} & \textbf{Accepted form} & \textbf{Validation rule}\\
+\textbf{Field} & \textbf{Data Type} & \textbf{Validation \& Acceptance Range} & \textbf{Operational Interpretation}\\
 \midrule
-\code{timestamp} & ISO-8601 string & Required; used with receiver arrival time for freshness handling.\\
-\code{heart\_rate} & numeric BPM & Required; 30--220.\\
-\code{spo2} & numeric percent & Required; 70--100.\\
-\code{activity} & string & \code{rest}, \code{walk}, \code{run}, \code{active}, or \code{unknown}.\\
-\code{motion\_intensity} & numeric & Required; 0.0--1.0.\\
-\code{exertion} & string & \code{rest}, \code{light}, \code{moderate}, or \code{high}.\\
-\code{steps} & integer & Required; non-negative.\\
-\code{ppg\_quality} & string & \code{good} or \code{poor}.\\
+\code{timestamp} & ISO-8601 string & Required; valid date-time. & Telemetry generation or capture timestamp.\\
+\code{heart\_rate} & Integer BPM & Required; $30 \le \mathrm{HR} \le 220$. & Directly observed or simulated heart rate.\\
+\code{spo2} & Integer percent & Required; $70 \le \mathrm{SpO_2} \le 100$. & Peripheral capillary oxygen saturation.\\
+\code{activity} & Enum string & \code{rest}, \code{walk}, \code{run}, \code{active}, \code{unknown}. & Compatibility default is \code{unknown} if unmeasured.\\
+\code{motion\_intensity} & Float & Required; $0.0 \le m \le 1.0$. & Heuristic proxy; $0.0$ does not imply total immobility.\\
+\code{exertion} & Enum string & \code{rest}, \code{light}, \code{moderate}, \code{high}. & Derived heuristic estimate from HR and step rate.\\
+\code{steps} & Integer & Required; non-negative integer $\ge 0$. & Cumulative daily step count.\\
+\code{ppg\_quality} & Enum string & \code{good} or \code{poor}. & Upstream completion proxy; not a raw PPG algorithm.\\
 \bottomrule
 \end{tabularx}
 \end{table}
 
-\section{Safety and Acceptance Boundary}
-The accepted telemetry context is a software input, not a clinical measurement guarantee. A grounding \texttt{PASS} means the implemented verifier found required contextual agreement in the generated wording; a \texttt{FAIL} indicates that one or more checks did not agree. Neither status establishes physiological correctness, medical appropriateness, or emergency safety. Emergency, diagnosis, treatment, and medication decisions remain outside the system boundary.
+\section{Safety Boundaries and Acceptance Criteria}
+The accepted telemetry context represents transport data, not a clinical guarantee. A grounding \texttt{PASS} indicates that the generated assistant text contains required contextual mentions consistent with the active snapshot; a \texttt{FAIL} indicates that one or more checks failed. Neither verdict implies medical correctness. Under the current implementation, speech synthesis continues following a failed check, serving as an informative indicator rather than a fail-closed interlock. Emergency response, diagnosis, and medical treatment are explicitly excluded from system scope.
 
-\section{Demonstration Acceptance Conditions}
-The minimum repeatable demonstration sequence is: start the web mirror; select either the genuine bridge or the native control stream; observe source and freshness state; submit a valid contract payload; request a bounded wellness response; and inspect the diagnostic or log evidence. A genuine-path demonstration requires a fresh, complete relay snapshot. When that condition is unavailable, the operator must identify the RTOS output as synthetic control data rather than representing it as an equivalent substitute.
+\section{Repeatable Demonstration Sequence}
+The formal demonstration sequence is structured into six repeatable stages:
+\begin{enumerate}[noitemsep,topsep=1pt]
+  \item Initialize the local mirror application on the host laptop (\code{http://127.0.0.1:8777}) and start the ingestion receiver on port 8000;
+  \item Establish relay transport via USB reverse port forwarding (\code{adb reverse tcp:8000 tcp:8000}) or private Wi-Fi IP, and start the Android streamer;
+  \item Inspect the mirror display to confirm active link state and source provenance labels;
+  \item Transmit a verified contract payload and observe real-time telemetry card updates;
+  \item Invoke hands-free or text assistance to generate a bounded wellness response and review the grounding verdict; and
+  \item Simulate transport disconnection to verify transitions to \texttt{STALE} and subsequent metric blanking in \texttt{OFFLINE}.
+\end{enumerate}

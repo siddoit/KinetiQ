@@ -47,6 +47,8 @@ import re
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -68,7 +70,9 @@ def _patch_windows_socketpair():
     def _safe_socketpair(family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0):
         for port in range(49200, 49950):
             lsock = socket.socket(family, type, proto)
+            csock = None
             try:
+                lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 lsock.bind(("127.0.0.1", port))
                 lsock.listen(1)
                 csock = socket.socket(family, type, proto)
@@ -77,16 +81,19 @@ def _patch_windows_socketpair():
                 lsock.close()
                 return (ssock, csock)
             except Exception:
-                try:
-                    lsock.close()
-                except Exception:
-                    pass
+                for s in (csock, lsock):
+                    if s is not None:
+                        try:
+                            s.close()
+                        except Exception:
+                            pass
                 continue
         if orig:
             return orig(family, type, proto)
+        raise OSError("Unable to establish local socketpair")
 
     socket.socketpair = _safe_socketpair
-    socket._kinetiq_patched = True
+    socket._kinetiq_patched = True  # type: ignore[attr-defined]
 
 
 _patch_windows_socketpair()
@@ -103,7 +110,7 @@ from telemetry_schema import TelemetryError, TelemetryRecord  # noqa: E402
 DEFAULT_OLLAMA_URL = "http://localhost:11434/api/generate"
 DEFAULT_OLLAMA_MODEL = "gemma2:2b"
 DEFAULT_API_MODEL = "gpt-4o-mini"
-DEFAULT_TIMEOUT_S = 20.0
+DEFAULT_TIMEOUT_S = 30.0
 DEFAULT_MOCK_SECONDS = 3.0
 DEFAULT_MOCK_INTERVAL_S = 0.2
 MAX_RESPONSE_WORDS = 100
@@ -233,7 +240,22 @@ def strip_emojis(text: str) -> str:
         .replace("\u2014", "-")
         .replace("\u2013", "-")
     )
+    # Collapse excessive whitespace while preserving single spaces
+    text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def _enforce_word_limit(text: str, max_words: int = MAX_RESPONSE_WORDS) -> str:
+    """Trim text cleanly at a sentence boundary if it exceeds max_words."""
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    truncated = " ".join(words[: max_words - 2])
+    # Try to cut cleanly at the last sentence-ending punctuation
+    last_punct = max(truncated.rfind(". "), truncated.rfind("! "), truncated.rfind("? "))
+    if last_punct > len(truncated) // 2:
+        return truncated[: last_punct + 1].strip()
+    return truncated.rstrip(".,;:") + "."
 
 
 class PromptBuilder:
@@ -245,7 +267,7 @@ class PromptBuilder:
         "Ground and personalize your advice around their live vitals (heart rate BPM, activity, exertion, steps) as context. "
         "Do not repeatedly give generic stretching advice unless asked. "
         "Never provide formal medical diagnoses or prescriptions. If signal quality is POOR, state that metrics are unverified estimates. "
-        "Keep responses natural, conversational, and concise (under 85 words, 2-4 sentences). "
+        "Keep responses natural, conversational, and concise (under 70 words, 2-4 sentences). "
         "Do not use any emojis or emoticons in your responses; use plain text only."
     )
 
@@ -278,24 +300,29 @@ class PromptBuilder:
         visual_note = ""
         if visual_context and isinstance(visual_context, dict):
             desc = visual_context.get("descriptor") or visual_context.get("label")
-            tone = visual_context.get("tone")
-            if desc:
+            face_seen = visual_context.get("face_detected", True)
+            if desc and face_seen:
                 visual_note = (
                     f" Mirror vision observes user appears {desc}."
                     f" Reflect this empathetically in your tone and advice."
                 )
 
+        act = str(payload.get("activity", "unknown")).strip()
+        act_clause = (
+            f"activity ('{act}'), " if act and act.lower() != "unknown" else ""
+        )
+
         if is_summary or not query:
             return (
                 f"Directly summarize the user's current wellness state.{visual_note} "
-                f"Mention their current activity ('{payload['activity']}'), "
+                f"Mention their current {act_clause}"
                 f"exertion ('{payload['exertion']}'), heart rate ('{payload['heart_rate']} BPM'), and steps ('{payload['steps']} steps'), "
                 f"followed by an encouraging wellness tip. Do not use emojis.{poor_note}"
             )
         return (
             f"First and foremost, directly and thoughtfully answer what the user asked: \"{query}\".{visual_note} "
             f"Then connect your explanation to their live physiological context (current heart rate '{payload['heart_rate']} BPM', "
-            f"'{payload['activity']}' at '{payload['exertion']}' exertion, and '{payload['steps']} steps') where relevant. "
+            f"{act_clause}at '{payload['exertion']}' exertion, and '{payload['steps']} steps') where relevant. "
             f"Provide insightful health guidance rather than generic canned stretching advice. Do not use emojis.{poor_note}"
         )
 
@@ -313,12 +340,13 @@ class PromptBuilder:
         vis_line = ""
         if visual_context and isinstance(visual_context, dict):
             v_desc = visual_context.get("descriptor") or visual_context.get("label")
-            if v_desc:
+            face_seen = visual_context.get("face_detected", True)
+            if v_desc and face_seen:
                 vis_line = f"\nObserved Facial Expression / State: {v_desc}\n"
         content = (
             f"User: {query}\n\n"
             f"Live Telemetry Context:\n{body}\n{vis_line}\n"
-            f"{instruction}\nKeep it natural and under 85 words. Do not give medical diagnoses."
+            f"{instruction}\nKeep it natural and under 70 words. Do not give medical diagnoses."
         )
         return [
             {"role": "system", "content": self.SYSTEM_PROMPT},
@@ -339,7 +367,8 @@ class PromptBuilder:
         vis_line = ""
         if visual_context and isinstance(visual_context, dict):
             v_desc = visual_context.get("descriptor") or visual_context.get("label")
-            if v_desc:
+            face_seen = visual_context.get("face_detected", True)
+            if v_desc and face_seen:
                 vis_line = f"\nObserved Facial Expression / State: {v_desc}\n"
         return (
             f"<start_of_turn>user\n"
@@ -391,14 +420,14 @@ class AIAdvisor:
         reply = self._try_ollama(prompt)
         if reply:
             self.last_backend = "ollama"
-            return strip_emojis(reply)
+            return _enforce_word_limit(strip_emojis(reply))
         errors.append(f"ollama: {self.last_error or 'no reply'}")
 
         if self.api_url:
             reply = self._try_api(messages)
             if reply:
                 self.last_backend = "api"
-                return strip_emojis(reply)
+                return _enforce_word_limit(strip_emojis(reply))
             errors.append(f"api: {self.last_error or 'no reply'}")
         else:
             errors.append(f"api: not configured (set {ENV_API_URL}/{ENV_API_KEY})")
@@ -411,44 +440,58 @@ class AIAdvisor:
 
     def is_available(self) -> bool:
         """Cheap liveness probe of the local Ollama server; never raises."""
-        try:
-            import requests  # lazy: console path must work without network deps
-        except ImportError:
-            return False
-
         base = self.ollama_url.split("/api/")[0] or self.ollama_url
         try:
+            import requests  # lazy: console path must work without network deps
+
             resp = requests.get(base, timeout=1.0)
+            return resp.status_code < 400
+        except ImportError:
+            try:
+                req = urllib.request.Request(base, method="GET")
+                with urllib.request.urlopen(req, timeout=1.0) as resp:
+                    return int(getattr(resp, "status", 200)) < 400
+            except Exception:
+                return False
         except Exception:
             return False
-        return resp.status_code < 400
+
+    def _post_json(
+        self, url: str, body: Dict[str, Any], headers: Optional[Dict[str, str]] = None
+    ) -> Dict[str, Any]:
+        """POST JSON via requests (if installed) or stdlib urllib.request."""
+        hdrs = {"Content-Type": "application/json"}
+        if headers:
+            hdrs.update(headers)
+        try:
+            import requests
+
+            resp = requests.post(url, json=body, headers=hdrs, timeout=self.timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except ImportError:
+            raw_req = json.dumps(body).encode("utf-8")
+            req = urllib.request.Request(url, data=raw_req, headers=hdrs, method="POST")
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
 
     def _try_ollama(self, prompt: str) -> Optional[str]:
+        body = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "keep_alive": "60m",
+            "options": {
+                "temperature": 0.45,
+                "num_predict": 90,
+                "top_p": 0.85,
+                "top_k": 40,
+            },
+            "stop": ["<end_of_turn>", "\n\nUser:", "User:"],
+        }
         try:
-            import requests  # lazy import
-        except ImportError as exc:
-            self.last_error = f"requests not installed ({exc})"
-            return None
-
-        try:
-            resp = requests.post(
-                self.ollama_url,
-                json={
-                    "model": self.model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.5,
-                        "num_predict": 85,
-                        "top_p": 0.85,
-                        "top_k": 40,
-                    },
-                    "stop": ["<end_of_turn>", "\n\nUser:", "User:"],
-                },
-                timeout=self.timeout,
-            )
-            resp.raise_for_status()
-            text = str(resp.json().get("response", "")).strip()
+            data = self._post_json(self.ollama_url, body)
+            text = str(data.get("response", "")).strip()
         except Exception as exc:  # connection refused, HTTP error, bad JSON
             self.last_error = f"{type(exc).__name__}: {exc}"
             return None
@@ -459,27 +502,24 @@ class AIAdvisor:
         return text
 
     def _try_api(self, messages: List[Dict[str, str]]) -> Optional[str]:
-        try:
-            import requests  # lazy import
-        except ImportError as exc:
-            self.last_error = f"requests not installed ({exc})"
-            return None
-
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
+        api_model = (
+            self.model
+            if (self.model and self.model != DEFAULT_OLLAMA_MODEL)
+            else DEFAULT_API_MODEL
+        )
         body = {
-            "model": self.model or DEFAULT_API_MODEL,
+            "model": api_model,
             "messages": messages,
+            "max_tokens": 120,
+            "temperature": 0.45,
             "stream": False,
         }
         try:
-            resp = requests.post(
-                self.api_url or "", json=body, headers=headers, timeout=self.timeout
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            data = self._post_json(self.api_url or "", body, headers=headers)
             text = str(data["choices"][0]["message"]["content"]).strip()
         except Exception as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
@@ -643,6 +683,9 @@ def verify_grounding(response: str, payload: Dict[str, Any]) -> List[str]:
     """Return the list of FAILED grounding checks (empty list means grounded)."""
     text = (response or "").strip()
     lowered = text.lower()
+    # Normalize digit-grouping commas (e.g., "4,181" -> "4181") so natural English
+    # formatting of step counts matches the integer value in the payload.
+    normalized_digits = re.sub(r"(?<=\d),(?=\d{3}\b)", "", text)
     failures: List[str] = []
 
     exertion = str(payload.get("exertion", "")).strip().lower()
@@ -678,7 +721,7 @@ def verify_grounding(response: str, payload: Dict[str, Any]) -> List[str]:
     # mechanical activity/exertion restatement is waived.
     raw_hr = str(payload.get("heart_rate", "")).strip()
     live_hr = int(raw_hr) if raw_hr.isdigit() else None
-    if live_hr is not None and re.search(r"\b{0}\b".format(live_hr), text):
+    if live_hr is not None and re.search(r"(?<!\d){0}(?!\d)".format(live_hr), normalized_digits):
         if any(word in lowered for word in ("heart", "bpm", "beats", "pulse", "rate")):
             failures = [
                 f
@@ -690,7 +733,9 @@ def verify_grounding(response: str, payload: Dict[str, Any]) -> List[str]:
             ]
 
     raw_steps = str(payload.get("steps", "")).strip()
-    if raw_steps.isdigit() and re.search(r"\b{0}\b".format(raw_steps), text):
+    if raw_steps.isdigit() and re.search(
+        r"(?<!\d){0}(?!\d)".format(raw_steps), normalized_digits
+    ):
         failures = [
             f
             for f in failures

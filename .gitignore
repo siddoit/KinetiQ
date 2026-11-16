@@ -68,6 +68,9 @@ final_kinetiq_minor_project_report/build/
 *.lot
 *.run.xml
 *.toc
+*.log
+*.out
+*.synctex.gz
 
 # ---------------------------------------------------------------------------
 # Backups

@@ -15,10 +15,14 @@ import os
 import sys
 import threading
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
-import cv2
-import numpy as np
+try:
+    import cv2  # type: ignore
+    import numpy as np  # type: ignore
+except ImportError:
+    cv2 = None  # type: ignore
+    np = None  # type: ignore
 
 # Emotion mapping for empathetic wellness coaching
 EMOTION_WELLNESS_MAP = {
@@ -64,6 +68,21 @@ EMOTION_WELLNESS_MAP = {
     },
 }
 
+_NEGATIVE_EMOTIONS = frozenset({"Anger", "Fear", "Sadness", "Disgust", "Contempt"})
+
+
+def _neutral_result(face_detected: bool = False) -> Dict[str, Any]:
+    mapping = EMOTION_WELLNESS_MAP["Neutral"]
+    return {
+        "raw_emotion": "Neutral",
+        "descriptor": mapping["descriptor"],
+        "label": mapping["label"],
+        "tone": mapping["tone"],
+        "confidence": 1.0,
+        "face_detected": face_detected,
+        "timestamp": time.time(),
+    }
+
 
 class EmotionDetector:
     """Singleton detector caching the HSEmotion ONNX session and Haar cascade."""
@@ -76,14 +95,8 @@ class EmotionDetector:
         self._model = None
         self._cascade = None
         self._load_error: Optional[str] = None
-        self._last_result: Dict[str, Any] = {
-            "raw_emotion": "Neutral",
-            "descriptor": "calm and balanced",
-            "label": "Calm / Balanced",
-            "confidence": 1.0,
-            "face_detected": False,
-            "timestamp": time.time(),
-        }
+        self._prev_raw: str = "Neutral"
+        self._last_result: Dict[str, Any] = _neutral_result(face_detected=False)
         self._init_models()
 
     @classmethod
@@ -94,6 +107,10 @@ class EmotionDetector:
             return cls._instance
 
     def _init_models(self) -> None:
+        if cv2 is None or np is None:
+            self._load_error = "opencv-python / numpy not installed"
+            return
+
         try:
             from hsemotion_onnx.facial_emotions import HSEmotionRecognizer
 
@@ -112,27 +129,35 @@ class EmotionDetector:
         except Exception as exc:
             print(f"[EmotionDetector] Cascade init warning: {exc}", file=sys.stderr)
 
-    def detect_emotion_from_bgr(self, frame: np.ndarray) -> Dict[str, Any]:
+    def detect_emotion_from_bgr(self, frame: Any) -> Dict[str, Any]:
         """Detect emotion from an OpenCV BGR frame in <30ms."""
-        if frame is None or frame.size == 0 or self._model is None:
+        if (
+            cv2 is None
+            or np is None
+            or frame is None
+            or getattr(frame, "size", 0) == 0
+            or self._model is None
+        ):
             return dict(self._last_result)
 
         h, w = frame.shape[:2]
         face_roi = None
         face_detected = False
 
-        # 1. Try Haar face detection
+        # 1. Try Haar face detection with histogram equalization for dim rooms
         if self._cascade is not None and not self._cascade.empty():
             try:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                # Scale down for ultra-fast face search
+                gray_eq = cv2.equalizeHist(gray)
                 faces = self._cascade.detectMultiScale(
-                    gray, scaleFactor=1.15, minNeighbors=4, minSize=(40, 40)
+                    gray_eq, scaleFactor=1.12, minNeighbors=4, minSize=(36, 36)
                 )
+                if len(faces) == 0:
+                    faces = self._cascade.detectMultiScale(
+                        gray, scaleFactor=1.15, minNeighbors=4, minSize=(36, 36)
+                    )
                 if len(faces) > 0:
-                    # Pick largest face
                     fx, fy, fw, fh = max(faces, key=lambda b: b[2] * b[3])
-                    # Expand ROI slightly by 10%
                     pad_x = int(fw * 0.1)
                     pad_y = int(fh * 0.1)
                     x1 = max(0, fx - pad_x)
@@ -144,19 +169,14 @@ class EmotionDetector:
             except Exception:
                 face_roi = None
 
-        # 2. Fallback: Center crop (mirror user is in center of frame)
-        if face_roi is None or face_roi.size == 0 or face_roi.shape[0] < 12 or face_roi.shape[1] < 12:
-            cy1 = max(0, int(h * 0.15))
-            cy2 = min(h, int(h * 0.85))
-            cx1 = max(0, int(w * 0.20))
-            cx2 = min(w, int(w * 0.80))
-            if cy2 > cy1 and cx2 > cx1:
-                face_roi = frame[cy1:cy2, cx1:cx2]
-            else:
-                face_roi = frame
-
-        if face_roi is None or face_roi.size == 0:
-            return dict(self._last_result)
+        # 2. If no face is detected by Haar Cascade, do NOT feed background wall
+        # textures into EfficientNet as negative emotions (walls often classify
+        # as Sadness/Fear/Anger). Return a calm baseline until a face is seen.
+        if not face_detected or face_roi is None or face_roi.size == 0 or face_roi.shape[0] < 12 or face_roi.shape[1] < 12:
+            with self._lock:
+                self._prev_raw = "Neutral"
+                self._last_result = _neutral_result(face_detected=False)
+                return dict(self._last_result)
 
         # 3. ONNX HSEmotion prediction (EfficientNet expects RGB format)
         try:
@@ -170,34 +190,39 @@ class EmotionDetector:
                     face_rgb, logits=False
                 )
                 conf = float(np.max(scores)) if scores is not None else 0.90
+                raw_str = str(raw_emo)
 
-            mapping = EMOTION_WELLNESS_MAP.get(
-                raw_emo,
-                {
-                    "descriptor": "calm and balanced",
-                    "label": "Calm",
-                    "tone": "balanced",
-                },
-            )
+                # Temporal & confidence gate: prevent single-frame talking/blinking
+                # artifacts from triggering false Anger/Fear/Disgust alerts.
+                if raw_str in _NEGATIVE_EMOTIONS and conf < 0.48 and self._prev_raw != raw_str:
+                    self._prev_raw = raw_str
+                    raw_str = "Neutral"
+                else:
+                    self._prev_raw = raw_str
 
-            result = {
-                "raw_emotion": str(raw_emo),
-                "descriptor": mapping["descriptor"],
-                "label": mapping["label"],
-                "tone": mapping.get("tone", "balanced"),
-                "confidence": round(conf, 3),
-                "face_detected": face_detected,
-                "timestamp": time.time(),
-            }
-            self._last_result = result
-            return result
+                mapping = EMOTION_WELLNESS_MAP.get(
+                    raw_str,
+                    EMOTION_WELLNESS_MAP["Neutral"],
+                )
+
+                result = {
+                    "raw_emotion": raw_str,
+                    "descriptor": mapping["descriptor"],
+                    "label": mapping["label"],
+                    "tone": mapping.get("tone", "balanced"),
+                    "confidence": round(conf, 3),
+                    "face_detected": face_detected,
+                    "timestamp": time.time(),
+                }
+                self._last_result = result
+                return dict(result)
         except Exception as exc:
             print(f"[EmotionDetector] Prediction failed: {exc}", file=sys.stderr)
             return dict(self._last_result)
 
     def detect_from_base64(self, data_url_or_b64: str) -> Dict[str, Any]:
         """Decode base64 JPEG from browser canvas and classify emotion."""
-        if not data_url_or_b64:
+        if not data_url_or_b64 or cv2 is None or np is None:
             return dict(self._last_result)
 
         try:

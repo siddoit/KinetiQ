@@ -1,11 +1,12 @@
 \chapter{RESULTS AND DISCUSSION}
 
 \section{Evidence Classification}
-The results are classified by pathway and test condition before interpretation. A receiver CSV row, a mock stream, a simulator diagnostic, and a physical sensor trace have different evidential meaning. Table~\ref{tab:evidence-classification} prevents a successful bounded test from being presented as a broader system claim.
+The results are classified by pathway and test condition before interpretation. A receiver log entry, an evaluation stream, a simulator diagnostic, and a physical sensor trace have different evidential meaning. Table~\ref{tab:evidence-classification} prevents a successful bounded test from being presented as a broader system claim.
 
 \begin{table}[H]
 \centering
-\small
+\footnotesize
+\renewcommand{\arraystretch}{0.98}
 \caption{Evidence classification used for reported observations.}
 \label{tab:evidence-classification}
 \begin{tabularx}{\textwidth}{p{39mm}p{45mm}Y}
@@ -13,7 +14,7 @@ The results are classified by pathway and test condition before interpretation. 
 \textbf{Evidence} & \textbf{What it establishes} & \textbf{What it does not establish}\\
 \midrule
 Huawei relay receiver row & A relay payload reached and was stored by the authenticated local receiver. & Browser display of every row; clinical validity; direct Huawei API use.\\
-Dashboard mock CSV & A synthetic stream was processed under its recorded run condition. & Live wearable throughput or clinical telemetry performance.\\
+Dashboard telemetry evaluation & A synthetic stream was processed under its recorded run condition. & Live wearable throughput or clinical telemetry performance.\\
 BLE mock counter & Mock routing handled the stated message count. & Device-specific BLE pairing or Huawei Band transport.\\
 FreeRTOS host diagnostics & Behaviour of the Windows-hosted control runtime. & Hard real-time guarantee or genuine physiology.\\
 Wokwi sketch & Simulated hardware/control logic and planned pin pathway. & Physical sensor acquisition or calibration.\\
@@ -22,11 +23,12 @@ Wokwi sketch & Simulated hardware/control logic and planned pin pathway. & Physi
 \end{table}
 
 \section{Genuine Wearable-Path Observation}
-The receiver log contains Huawei-Health relay entries dated 22 October 2026. One complete record stores heart rate 60 BPM, SpO\textsubscript{2} 100\%, stress 57, and 4,181 steps, identified as \code{huawei\_band\_6\_healthapp}, \code{simulated=false}, and transport \code{health\_app\_ui}. The same record classifies heart rate and stress as real-time while labelling SpO\textsubscript{2} historical. A nearby earlier record stores 74 BPM, 100\% SpO\textsubscript{2}, stress 57, and 4,181 steps. These are documented relay observations, not clinical measurements.
+The receiver log contains Huawei-Health relay entries dated 22 October 2026. One complete record stores heart rate 60 BPM, SpO\textsubscript{2} 100\%, stress 57, and 4,181 steps, identified as \code{huawei\_\allowbreak band\_\allowbreak 6\_\allowbreak healthapp}, \code{simulated=false}, and transport \code{health\_app\_ui}. The same record classifies heart rate and stress as real-time while labelling SpO\textsubscript{2} historical. A nearby earlier record stores 74 BPM, 100\% SpO\textsubscript{2}, stress 57, and 4,181 steps. These are documented relay observations, not clinical measurements.
 
 \begin{table}[H]
 \centering
-\small
+\footnotesize
+\renewcommand{\arraystretch}{0.98}
 \caption{Selected documented Huawei-Health relay observations at the local receiver.}
 \label{tab:genuine-observations}
 \begin{tabularx}{\textwidth}{p{28mm}p{18mm}p{18mm}p{17mm}p{18mm}Y}
@@ -47,50 +49,56 @@ Integration logic covers complete live snapshots, missing HR/SpO\textsubscript{2
 
 No statistic for live rejection rate is reported because a controlled representative sample count and test log for that rate were not identified. The result establishes branch behaviour in the available integration test and source, not a field reliability percentage.
 
-\section{Dashboard Mock Stream}
-The recorded dashboard session \code{session\_20261014\_193826.csv} contains 75 telemetry frames over 15 seconds with zero dropped frames in the associated documented mock run. Figure~\ref{fig:mock-telemetry} retains the source chart's explicit synthetic label. The chart consists of a mock sensor stream, so its apparent time trends must not be interpreted as genuine wearable biometrics.
+\section{Dashboard Telemetry Evaluation}
+The recorded dashboard telemetry session contains 75 telemetry frames over 15 seconds with zero dropped frames in the associated documented evaluation run. Figure~\ref{fig:mock-telemetry} retains the source chart's explicit synthetic label. The chart consists of a synthetic sensor stream, so its apparent time trends must not be interpreted as genuine wearable biometrics.
 
 \begin{figure}[H]
 \centering
-\begin{subfigure}[t]{0.48\textwidth}
+\vspace{-2mm}
+\begin{subfigure}[t]{0.46\textwidth}
   \centering
   \includegraphics[width=\textwidth]{ui_live.png}
   \caption{Live}
   \label{fig:dashboard-states-live}
 \end{subfigure}\hfill
-\begin{subfigure}[t]{0.48\textwidth}
+\begin{subfigure}[t]{0.46\textwidth}
   \centering
   \includegraphics[width=\textwidth]{ui_unchanged.png}
   \caption{Unchanged}
   \label{fig:dashboard-states-unchanged}
-\end{subfigure}\\[3pt]
-\begin{subfigure}[t]{0.48\textwidth}
+\end{subfigure}\\[2mm]
+\begin{subfigure}[t]{0.46\textwidth}
   \centering
   \includegraphics[width=\textwidth]{ui_stale.png}
   \caption{Stale}
   \label{fig:dashboard-states-stale}
 \end{subfigure}\hfill
-\begin{subfigure}[t]{0.48\textwidth}
+\begin{subfigure}[t]{0.46\textwidth}
   \centering
   \includegraphics[width=\textwidth]{ui_offline.png}
   \caption{Offline}
   \label{fig:dashboard-states-offline}
 \end{subfigure}
+\vspace{-2mm}
 \caption[Dashboard freshness states (synthetic input)]{Dashboard freshness states observed under controlled synthetic input: live, unchanged, stale and offline. These captures exercise the freshness/offline logic; they are not live wearable telemetry.}
 \label{fig:dashboard-states}
+\vspace{-2mm}
 \end{figure}
 
 \begin{figure}[H]
 \centering
-\includegraphics[width=\textwidth]{mock_telemetry_results.png}
+\vspace{-2mm}
+\includegraphics[width=0.72\textwidth]{mock_telemetry_results.png}
+\vspace{-2mm}
 \caption[Mock telemetry session (synthetic, 30 samples)]{Mock telemetry session: synthetic sensor stream (30 samples at approximately 1 Hz) from the project materials. It is not a genuine biometric time series.}
 \label{fig:mock-telemetry}
+\vspace{-2mm}
 \end{figure}
 
 The zero-drop result establishes that the documented mock dashboard session maintained its recorded frame count under those input and host conditions. It does not establish throughput for the phone relay, an arbitrary browser load, or all live wearable sessions.
 
 \section{BLE Mock and Voice Observation}
-The BLE client mock is configured with \code{--source mock --mock-count 30}; the project result records 30 routed messages with zero rejections. This confirms the mock route and its message handling for the defined input. It does not confirm physical BLE communication with Huawei Band 6 or any other wearable.
+The Bluetooth Low Energy client test configuration processed 30 routed messages with zero rejections. This confirms the pipeline route and its message handling for the defined input. It does not confirm physical BLE communication with Huawei Band 6 or any other wearable.
 
 The voice pipeline result records 0.48 s for faster-whisper transcription of a synthesized audio clip. The software uses the \code{tiny.en} model with \code{int8} inference. The metric is useful for a local demonstration latency budget, but it does not assess live microphone capture, noise, language variation, or correctness of a wellness utterance.
 
@@ -107,7 +115,8 @@ The physical embedded hardware remains planned or simulated. The final-review co
 
 \begin{table}[H]
 \centering
-\small
+\footnotesize
+\renewcommand{\arraystretch}{0.98}
 \caption{Reconciled component subtotal from the displayed final-review BOM.}
 \label{tab:bom-reconciliation}
 \begin{tabularx}{\textwidth}{Yp{32mm}p{37mm}}
@@ -126,3 +135,26 @@ Earlier Tier-A statement & INR~1,950 & Not retained as verified: its revision/it
 
 \section{Overall Verification Summary}
 The strongest verified elements are the eight-field validation logic, dashboard freshness design, native FreeRTOS task structure, synthetic fallback, and documented local receiver records. The genuine wearable path is partially demonstrated through relay data and bridge rules but lacks complete browser-render evidence for each cited observation. Voice and grounding modules are implemented but only receive narrow test evidence. Physical sensors remain outside the validated final runtime. These qualifications preserve the engineering value of the working modules without extending the evidence beyond its scope.
+
+Table~\ref{tab:verification-matrix} consolidates the verification status, observed behavior, and documented limitations across all system features.
+
+\begin{table}[H]
+\centering
+\scriptsize
+\renewcommand{\arraystretch}{0.98}
+\caption{System verification matrix across all evaluated components.}
+\label{tab:verification-matrix}
+\begin{tabularx}{\textwidth}{p{24mm}p{30mm}p{34mm}p{26mm}Y}
+\toprule
+\textbf{Feature / Subsystem} & \textbf{Input Condition} & \textbf{Expected Outcome} & \textbf{Status} & \textbf{Stated Limitation}\\
+\midrule
+Wearable Ingestion & Huawei Health UI streaming via relay. & Ingest HR, $\mathrm{SpO_2}$, steps at receiver. & Partially verified & Relies on companion app UI rendering; no direct watch API.\\
+Contract Ingress & 8-field JSON payloads with out-of-range keys. & Reject malformed or invalid packets. & Implemented and tested & Validates transport contract; does not ensure medical accuracy.\\
+Freshness States & Live stream interruption ($>60$\,s, $>300$\,s). & Transition to Stale, blank values at Offline. & Implemented and tested & Evaluates arrival age at receiver; underlying sensor latency unknown.\\
+FreeRTOS Tasks & Native v11 simulation with 1\,Hz telemetry. & Task release, queue transfer, diagnostics. & Partially verified (host simulation) & Windows host execution does not provide certified hard-deadline bounds.\\
+Grounding Verifier & Assistant output vs accepted vitals. & Render \texttt{PASS}/\texttt{FAIL} consistency tag. & Partially verified & Informative rule check; does not gate text-to-speech output.\\
+Speech-to-Text & Synthesized audio clip (faster-whisper). & Transcribe utterance under 0.5\,s. & Partially verified & Benchmarked on synthesized clip; acoustic noise unverified.\\
+Physical Sensing & ESP32 pinout and sensor breadboard wiring. & Acquire calibrated physical biometrics. & Planned / Simulation & Evaluated in Wokwi simulator; physical sensor deployment pending.\\
+\bottomrule
+\end{tabularx}
+\end{table}

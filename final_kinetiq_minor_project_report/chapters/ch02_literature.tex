@@ -1,30 +1,70 @@
 \chapter{LITERATURE REVIEW AND TECHNICAL BACKGROUND}
 
-\section{Real-Time Tasks and Embedded Telemetry}
-An RTOS partitions work into independently scheduled tasks and provides communication primitives that preserve ownership and ordering. FreeRTOS queues copy items into an internal buffer and are commonly used to transfer messages between producer and consumer tasks \cite{freertosQueues}. Mutexes add mutual exclusion and priority-inheritance behaviour for protected shared resources \cite{freertosMutex}. These mechanisms are directly relevant to the native KINETIQ control node: simulated sensing produces samples, classification consumes them, and telemetry publishes a single coherent output stream.
+\section{Smart Mirrors and Ambient Wellness Interfaces}
+Ambient Assisted Living (AAL) environments increasingly utilise smart mirrors as unobtrusive, daily-routine interfaces for ambient health monitoring. By integrating reflective surfaces with semi-transparent displays and embedded computing, smart mirrors allow individuals to review physiological trends during natural grooming routines without dedicated medical hardware. 
 
-Real-time terminology requires restraint. A periodic task can measure release lateness and queue accumulation on a desktop simulator, but the host operating system and console I/O prevent that observation from constituting a hard timing guarantee. KINETIQ consequently records nominal period, observed lateness, queue high-water mark, dropped events, and missed-deadline count as diagnostics rather than advertising a real-time certification.
+The seminal Wize Mirror project developed by Andreu et al.~\cite{andreu2016wize} established a multisensory smart-mirror platform aimed at cardio-metabolic risk prevention, integrating multispectral imaging, 3D optical scanning, and video photoplethysmography (PPG). While systems like the Wize Mirror illustrate the promise of ambient health hubs, they predominantly rely on complex, stationary physical sensor arrays or cloud processing pipelines. In consumer wellness contexts, smart mirrors must frequently integrate with third-party consumer wearables, introducing significant integration challenges regarding data provenance, transmission delay, and interface clarity.
 
-\section{Wearable Data and Android-Mediated Integration}
-Wearable ecosystems often expose data through platform-controlled applications, accounts, permissions, and health-data APIs. Huawei documents Wear Engine as a development framework for selected wearable use cases \cite{huaweiWear}; its availability and access model do not establish an implemented direct integration in KINETIQ. The examined implementation instead relies on Huawei Health's visible user-interface data and a user-enabled Android accessibility service. Android's accessibility-service documentation establishes the controlled UI-observation context and permission model \cite{androidAccessibility}. It does not convert an accessibility capture into a medical-grade data interface.
+\section{Wearable Health Integration and Mobile Relays}
+Consumer wearable devices provide continuous tracking of biometrics including heart rate, peripheral oxygen saturation ($\mathrm{SpO_2}$), and physical activity~\cite{patel2012review,lara2013survey}. However, integrating consumer wearables into ambient dashboards is often hindered by proprietary, closed ecosystems, restricting real-time access to cloud services or vendor SDKs like the Huawei Wear Engine~\cite{huaweiWear}. To circumvent proprietary API barriers without cloud dependencies, mobile-mediated extraction techniques utilise accessibility service frameworks~\cite{androidAccessibility} to inspect screen node hierarchies and observe rendered companion-app UI states (e.g., Huawei Health). While an accessibility relay streams biometrics via local HTTP POST payloads, it does not provide a direct sensor API. 
 
-This distinction leads to a useful evidence ladder. A value visible in Huawei Health is an upstream observation. A POST row at the local receiver establishes arrival at the receiver. A complete bridge output establishes eligibility for the eight-field mirror contract. A visible dashboard card establishes rendering. Each downstream claim requires its own evidence; an upstream screenshot cannot substitute for it.
+This architectural constraint establishes an operational evidence ladder:
+\begin{enumerate}[noitemsep,topsep=2pt]
+  \item a value displayed on a wearable screen or companion application represents an upstream observation;
+  \item an authenticated HTTP POST log at the local receiver confirms transport arrival;
+  \item a validated bridge payload confirms compliance with the system's shared schema; and
+  \item a rendered mirror card confirms local interface presentation.
+\end{enumerate}
+Downstream claims cannot assume data integrity based solely on upstream captures; each transition must be verified independently.
 
-\section{Validation, Freshness, and Provenance}
-Network telemetry requires more than syntactically valid JSON. Field presence, range limits, timestamp interpretation, source identity, and receiver arrival time all shape whether an observation should control an interface. KINETIQ uses strict validation to reject missing or out-of-range values. Its UI then distinguishes an arriving value from an unchanged value and transitions through live, stale, and offline states. This is especially important for wellness presentation, where displaying a cached card without a status marker creates an avoidable ambiguity.
+\section{Telemetry Freshness and Age of Information}
+In networked monitoring systems, conventional performance metrics such as throughput and latency do not adequately describe the freshness of status updates. Kaul, Yates, and Gruteser~\cite{kaul2012realtime} introduced the \textit{Age of Information} (AoI) metric, defined as the time elapsed since the generation timestamp of the most recently received update:
+\begin{equation}
+\Delta(t) = t - U(t)
+\end{equation}
+where $U(t)$ is the generation time of the freshest sample available at time $t$. As demonstrated by Kosta et al.~\cite{kosta2017age}, simply maximizing throughput can degrade AoI due to buffer congestion and delivery delays.
 
-Data provenance is represented operationally rather than as an abstract label: the originating lane, simulated flag, transport class, timestamp, and link state determine whether a sample is accepted and how it is described. The current contract intentionally limits the shared mirror data to eight fields. Additional upstream observations, such as stress, remain documented at the receiver but cannot silently appear as mirror context unless the contract and forwarding logic are extended.
+In a wellness mirror interface, stale data represents a critical failure mode: presenting an outdated measurement as active physiological telemetry can mislead the user. The wellness mirror addresses this by tracking receiver arrival timestamps, value-change fingerprints, and transport link states. By enforcing dynamic state transitions across \texttt{LIVE}, \texttt{UNCHANGED}, \texttt{STALE}, and \texttt{OFFLINE} regimes---and automatically blanking values when arrival age exceeds an offline threshold---the interface prevents cached telemetry from being mistaken for live observations.
 
-\section{Local Transport and Interface Security}
-The Python standard library provides a basic HTTP server suitable for local development and controlled interfaces, while warning that production hardening remains the application's responsibility \cite{pythonHttp}. KINETIQ limits its examined dashboard server to \code{127.0.0.1} and uses an authenticated POST mechanism at the local receiver. This reduces accidental exposure on a local network but is not a complete security assessment. Secret storage, transport encryption across device boundaries, replay resistance, mobile application hardening, and independent penetration testing remain outside the documented work.
+\section{Real-Time Scheduling and Embedded Telemetry}
+Real-time operating systems (RTOS) partition software into prioritized, concurrent tasks with bounded release jitter. Liu and Layland~\cite{liu1973scheduling} established the foundational principles of rate-monotonic and fixed-priority preemptive scheduling for periodic hard-real-time tasks. In embedded microcontroller environments, such as the Espressif ESP32 dual-core SoC~\cite{espDevKit,espHardware}, FreeRTOS provides deterministic synchronization primitives, including message queues for thread-safe data transfer and mutexes with priority inheritance to prevent priority inversion~\cite{freertosQueues,freertosMutex}.
 
-\section{Speech and Context-Grounded Assistance}
-The voice pathway uses faster-whisper, an implementation associated with CTranslate2-based Whisper inference \cite{fasterWhisper}. A transcription latency on a synthesized clip measures only one constrained machine-and-input condition; it does not measure live microphone robustness, accent coverage, noise performance, or medical communication safety.
+However, real-time claims must accurately reflect the host execution environment. When FreeRTOS v11 is executed as a Windows-hosted simulation process, the underlying non-real-time Windows kernel, host thread scheduling, and console I/O prevent the software from guaranteeing hard-real-time determinism. Under such conditions, task execution lateness, queue high-water marks, and missed-deadline counters function as observable diagnostic metrics for system evaluation rather than formal real-time proofs.
 
-Grounding in KINETIQ is narrower than retrieval-augmented generation. Retrieval-augmented generation combines a parametric generator with external non-parametric memory \cite{lewis2020rag}; the examined KINETIQ assistant instead injects the accepted current telemetry snapshot into a bounded prompt or deterministic template. A local verifier checks whether key response elements agree with the accepted activity, exertion, heart-rate, steps, or PPG-quality context. The resulting verdict makes the implemented consistency check visible, but it cannot prove factual completeness or clinical validity.
+\section{Context-Grounded Conversational AI and Speech}
+Recent advancements in large language models (LLMs) enable natural, conversational interaction in ambient interfaces. However, unconstrained LLMs are prone to hallucinations---generating fluent statements that contradict factual evidence or lack grounding~\cite{ji2023survey}. While Retrieval-Augmented Generation (RAG) retrieves unstructured document passages to ground knowledge-intensive queries~\cite{lewis2020rag}, edge-based wellness mirrors require structured parameter grounding: conditioning responses directly upon verified physiological metrics.
 
-\section{Embedded Hardware Context}
-The ESP32 development-board documentation describes the board family and connection context used for the selected hardware \cite{espDevKit}. Espressif also documents the importance of bootstrapping pins and schematic precautions \cite{espHardware}. These sources support component-aware design but do not establish that KINETIQ completed physical assembly or acquired a final sensor stream. The repository includes a Wokwi simulation route; Wokwi documents its browser-based electronics simulation environment \cite{wokwi}. Simulation is useful for control logic and pin-planning checks, while physical sensor noise, power integrity, enclosure effects, and wearability require later validation.
+For voice interaction, edge-optimized implementations such as faster-whisper~\cite{fasterWhisper}, based on OpenAI's Whisper speech-recognition architecture~\cite{radford2023whisper}, enable private, local transcription using quantized integer arithmetic (\code{int8}). To ensure interaction safety in non-clinical settings, conversational guidance must be strictly bounded in length and validated by a rule-based consistency checker before delivery.
 
-\section{Engineering Gap}
-Existing RTOS guidance explains task communication, and platform documentation explains constrained wearable or Android integration. Neither alone solves the presentation problem created when genuine observations, simulated control values, stale caches, and conversational output coexist in one mirror. KINETIQ addresses that bounded gap by making source and freshness explicit, applying a contract before UI and AI use, and retaining a labelled synthetic fallback. The work does not claim that no comparable product exists; it documents a transparent integration pattern for the specific implementation and evidence available.
+\section{Comparative Analysis of Related Systems}
+Table~\ref{tab:literature-comparison} summarizes existing approaches across smart mirrors, wearable health relays, real-time telemetry, and grounded language assistance, situating the present engineering work within the existing literature.
+
+\begin{table}[H]
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.04}
+\caption{Comparison of related smart-mirror, telemetry, and assistive systems.}
+\label{tab:literature-comparison}
+\begin{tabularx}{\textwidth}{p{28mm}p{25mm}p{38mm}Y}
+\toprule
+\textbf{System / Study} & \textbf{Core Approach} & \textbf{Key Capabilities} & \textbf{Architectural Limitations}\\
+\midrule
+Wize Mirror (Andreu et al.~\cite{andreu2016wize}) & Multisensory physical scanning & Video-PPG, facial semeiotics, cardio-metabolic index & Expensive custom hardware; no wearable companion integration.\\
+HAR Framework (Lara et al.~\cite{lara2013survey}) & Wearable accelerometer classification & Real-time human activity recognition & Lacks ambient interface; assumes direct raw sensor access.\\
+AoI Telemetry (Kaul et al.~\cite{kaul2012realtime}) & Queue-theoretic update optimization & Formal information freshness modelling & Purely theoretical/networking focus; no ambient display or AI.\\
+Standard RAG (Lewis et al.~\cite{lewis2020rag}) & Document vector retrieval & Grounded document QA & Unstructured text focus; unsuited for live numerical biometrics.\\
+\midrule
+\textbf{Proposed Wellness Mirror} & Dual-pathway with contract gating & Wearable UI relay, RTOS synthetic lane, AoI blanking, AI consistency verifier & Windows RTOS simulation; non-clinical heuristic mappings.\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Identified Engineering Gap}
+Existing research offers robust models for smart mirrors, AoI-based queueing, and conversational AI in isolation. However, an engineering gap exists in integrating consumer wearable streams with ambient mirror interfaces when direct vendor APIs are unavailable:
+\begin{itemize}[noitemsep,topsep=1pt]
+  \item \textbf{Data Provenance Conflation:} Ambient dashboard prototypes often lack explicit provenance tagging, risking the conflation of synthetic or simulated test feeds with genuine human physiological observations.
+  \item \textbf{Silent Stale Telemetry:} Conventional web dashboards frequently retain the last received measurement indefinitely upon sensor dropout or connection loss, without visible freshness indicators or automated blanking.
+  \item \textbf{Ungrounded Conversational Output:} Conversational voice assistants deployed in wellness contexts rarely verify generated guidance against active on-screen physiological metrics, introducing potential hallucinations.
+\end{itemize}
+
+This minor project addresses this gap through a dual-pathway architecture isolating genuine wearable observations from deterministic synthetic telemetry, enforcing an eight-field validation contract, exposing freshness states, and verifying assistant guidance against sensor context.

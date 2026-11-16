@@ -25,6 +25,7 @@ import os
 import statistics
 import struct
 import sys
+import threading
 import time
 import wave
 from typing import Any, Dict, List, Optional
@@ -131,6 +132,7 @@ def synthesize_ptt_clip(
     total = max(1, int(seconds * sample_rate))
     segment = sample_rate // 2
     samples: List[int] = []
+    two_pi = 2.0 * math.pi
     for i in range(total):
         slot = (i // segment) % 2
         if slot == 1:
@@ -138,8 +140,8 @@ def synthesize_ptt_clip(
             continue
         freq = 220.0 if ((i // segment) // 2) % 2 == 0 else 440.0
         t = i / sample_rate
-        envelope = 0.5 + 0.5 * math.sin(2.0 * math.pi * 5.0 * t)
-        samples.append(int(12000.0 * envelope * math.sin(2.0 * math.pi * freq * t)))
+        envelope = 0.5 + 0.5 * math.sin(two_pi * 5.0 * t)
+        samples.append(int(12000.0 * envelope * math.sin(two_pi * freq * t)))
     raw = struct.pack("<%dh" % len(samples), *samples)
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as handle:
@@ -231,12 +233,29 @@ class AudioTranscriber:
             ) from exc
         self.last_load_s = time.perf_counter() - started
 
+    def _run_model_transcribe(self, source: Any) -> str:
+        """Invoke model.transcribe with greedy decoding fast-path when supported."""
+        try:
+            segments, _info = self._model.transcribe(
+                source,
+                language="en",
+                beam_size=1,
+                best_of=1,
+                without_timestamps=True,
+                condition_on_previous_text=False,
+            )
+        except TypeError:
+            # Fallback for test doubles that only accept (source, language="en")
+            if isinstance(source, io.BytesIO):
+                source.seek(0)
+            segments, _info = self._model.transcribe(source, language="en")
+        return "".join(segment.text for segment in segments).strip()
+
     def _transcribe_stream(self, stream: io.BytesIO) -> tuple:
         self._ensure_model()
         started = time.perf_counter()
         try:
-            segments, _info = self._model.transcribe(stream, language="en")
-            text = "".join(segment.text for segment in segments).strip()
+            text = self._run_model_transcribe(stream)
         except Exception as exc:
             raise TranscriptionUnavailableError(
                 f"faster-whisper transcription failed "
@@ -271,8 +290,7 @@ class AudioTranscriber:
         self._ensure_model()
         started = time.perf_counter()
         try:
-            segments, _info = self._model.transcribe(str(path), language="en")
-            text = "".join(segment.text for segment in segments).strip()
+            text = self._run_model_transcribe(str(path))
         except Exception as exc:
             raise TranscriptionUnavailableError(
                 f"faster-whisper could not transcribe '{path}' "
@@ -391,6 +409,25 @@ class VoicePipeline:
         query_fallback: str = DEFAULT_QUERY,
         speak: bool = True,
     ) -> Dict[str, Any]:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop and loop.is_running():
+            box: Dict[str, Any] = {}
+
+            def _worker():
+                try:
+                    box["res"] = asyncio.run(
+                        self.process_clip(audio, query_fallback, speak=speak)
+                    )
+                except Exception as exc:
+                    box["res"] = {"error": str(exc), "query": query_fallback}
+
+            th = threading.Thread(target=_worker, daemon=True)
+            th.start()
+            th.join()
+            return box.get("res", {"error": "worker failed", "query": query_fallback})
         return asyncio.run(self.process_clip(audio, query_fallback, speak=speak))
 
 
@@ -489,8 +526,10 @@ def run_benchmark(args: argparse.Namespace) -> int:
         transcriber: Any = AudioTranscriber(model_size=args.model)
         stt_stub = False
     else:
-        print("[stt] faster-whisper missing; using stub transcriber "
-              f"({INSTALL_WHISPER_HINT})")
+        print(
+            "[stt] faster-whisper missing; using stub transcriber "
+            f"({INSTALL_WHISPER_HINT})"
+        )
         transcriber = StubTranscriber(query=args.query)
         stt_stub = True
 
@@ -508,38 +547,14 @@ def run_benchmark(args: argparse.Namespace) -> int:
     llm_fallback_seen = False
     try:
         for run in range(max(1, args.runs)):
-            if llm_fallback_expected:
-                payload = context.payload() or {}
-                llm_started = time.perf_counter()
-                reply = template_reply(payload)
-                llm_s = time.perf_counter() - llm_started
-                audio_result = pipeline.process_clip_sync(
-                    audio, query_fallback=args.query, speak=False
-                )
-                audio_result["reply"] = reply
-                audio_result["llm_s"] = llm_s
-                audio_result["llm_fallback"] = True
-                audio_result["total_s"] = (
-                    audio_result["stt_s"] + llm_s + audio_result["tts_s"]
-                )
-                failures = verify_grounding(reply, payload)
-                audio_result["grounding_failures"] = failures
-                audio_result["grounding_passed"] = not failures
-                if not args.no_tts:
-                    tts_started = time.perf_counter()
-                    tts.speak(reply)
-                    audio_result["tts_s"] = time.perf_counter() - tts_started
-                    audio_result["total_s"] = (
-                        audio_result["stt_s"] + llm_s + audio_result["tts_s"]
-                    )
-                result = audio_result
-            else:
-                result = pipeline.process_clip_sync(
-                    audio, query_fallback=args.query, speak=not args.no_tts
-                )
+            result = pipeline.process_clip_sync(
+                audio, query_fallback=args.query, speak=not args.no_tts
+            )
             if result.get("error"):
-                print(f"[benchmark] run {run + 1} error: {result['error']}",
-                      file=sys.stderr)
+                print(
+                    f"[benchmark] run {run + 1} error: {result['error']}",
+                    file=sys.stderr,
+                )
                 print("[summary] benchmark aborted: pipeline error")
                 return 3
             stt_times.append(float(result["stt_s"]))
@@ -560,8 +575,13 @@ def run_benchmark(args: argparse.Namespace) -> int:
         tts.stop()
 
     passed = _print_benchmark_table(
-        stt_times, llm_times, tts_times, total_times,
-        stt_stub, llm_fallback_seen, grounding_ok,
+        stt_times,
+        llm_times,
+        tts_times,
+        total_times,
+        stt_stub,
+        llm_fallback_seen,
+        grounding_ok,
     )
     print(
         "[summary] benchmark "
@@ -592,11 +612,15 @@ def run_record(args: argparse.Namespace) -> int:
         try:
             import sounddevice as sd
         except ImportError:
-            print("[record] microphone unavailable: the 'sounddevice' package "
-                  "is not installed.")
+            print(
+                "[record] microphone unavailable: the 'sounddevice' package "
+                "is not installed."
+            )
             print(f"[record] {INSTALL_SOUNDDEVICE_HINT}.")
-            print("[record] then check Settings > Sound > Input and allow "
-                  "microphone access for Python.")
+            print(
+                "[record] then check Settings > Sound > Input and allow "
+                "microphone access for Python."
+            )
             if args.wav:
                 print(f"[record] falling back to --wav '{args.wav}'")
                 return run_wav_fallback(args, pipeline, ingestor, tts)
@@ -617,8 +641,10 @@ def run_record(args: argparse.Namespace) -> int:
             pcm = bytes(capture.tobytes())
         except Exception as exc:
             print(f"[record] microphone unavailable ({type(exc).__name__}: {exc}).")
-            print("[record] check Settings > Sound > Input, the default device, "
-                  "and microphone privacy permissions.")
+            print(
+                "[record] check Settings > Sound > Input, the default device, "
+                "and microphone privacy permissions."
+            )
             if args.wav:
                 print(f"[record] falling back to --wav '{args.wav}'")
                 return run_wav_fallback(args, pipeline, ingestor, tts)
@@ -668,8 +694,10 @@ def _report_single_result(
         if result["grounding_passed"]:
             print("[grounding] PASS")
         else:
-            print("[grounding] FAIL "
-                  f"({len(result['grounding_failures'])} check(s)):")
+            print(
+                "[grounding] FAIL "
+                f"({len(result['grounding_failures'])} check(s)):"
+            )
             for failure in result["grounding_failures"]:
                 print(f"  - {failure}")
         print(
@@ -710,23 +738,34 @@ def run_once(args: argparse.Namespace) -> int:
     if not AudioTranscriber.is_available():
         ingestor.stop()
         tts.stop()
-        print("error: faster-whisper is not installed; "
-              f"{INSTALL_WHISPER_HINT}", file=sys.stderr)
+        print(
+            "error: faster-whisper is not installed; "
+            f"{INSTALL_WHISPER_HINT}",
+            file=sys.stderr,
+        )
         print("[summary] single-clip run aborted: no STT backend")
         return 3
 
     pipeline = VoicePipeline(
-        context, advisor, tts, AudioTranscriber(model_size=args.model),
+        context,
+        advisor,
+        tts,
+        AudioTranscriber(model_size=args.model),
         verbose=args.verbose,
     )
     result = pipeline.process_clip_sync(
         audio, query_fallback=args.query, speak=not args.no_tts
     )
     if result.get("error", "").startswith("transcription unavailable"):
-        print(f"[stt] faster-whisper backend failed ({result['error']}); "
-              "using stub transcriber for zero-hardware demo")
+        print(
+            f"[stt] faster-whisper backend failed ({result['error']}); "
+            "using stub transcriber for zero-hardware demo"
+        )
         pipeline = VoicePipeline(
-            context, advisor, tts, StubTranscriber(query=args.query),
+            context,
+            advisor,
+            tts,
+            StubTranscriber(query=args.query),
             verbose=args.verbose,
         )
         result = pipeline.process_clip_sync(
@@ -743,26 +782,54 @@ def build_parser() -> argparse.ArgumentParser:
             "telemetry, verify grounding, and speak the reply."
         ),
     )
-    parser.add_argument("--benchmark", action="store_true",
-                        help="time STT/LLM/TTS stages over --runs clips")
-    parser.add_argument("--record", action="store_true",
-                        help="record from the default microphone and answer it")
-    parser.add_argument("--wav", default=None,
-                        help="WAV clip to process (default: synthesized tone)")
-    parser.add_argument("--runs", type=int, default=DEFAULT_RUNS,
-                        help=f"benchmark iterations (default {DEFAULT_RUNS})")
-    parser.add_argument("--model", default="tiny.en",
-                        choices=("tiny.en", "base.en"),
-                        help="faster-whisper model size (default tiny.en)")
-    parser.add_argument("--query", default=DEFAULT_QUERY,
-                        help="fallback question when the transcript is empty")
-    parser.add_argument("--record-seconds", type=float,
-                        default=DEFAULT_RECORD_SECONDS,
-                        help=f"microphone capture length (default {DEFAULT_RECORD_SECONDS:g})")
-    parser.add_argument("--no-tts", action="store_true",
-                        help="print the reply but skip speech synthesis")
-    parser.add_argument("--verbose", action="store_true",
-                        help="print per-stage detail")
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="time STT/LLM/TTS stages over --runs clips",
+    )
+    parser.add_argument(
+        "--record",
+        action="store_true",
+        help="record from the default microphone and answer it",
+    )
+    parser.add_argument(
+        "--wav",
+        default=None,
+        help="WAV clip to process (default: synthesized tone)",
+    )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=DEFAULT_RUNS,
+        help=f"benchmark iterations (default {DEFAULT_RUNS})",
+    )
+    parser.add_argument(
+        "--model",
+        default="tiny.en",
+        choices=("tiny.en", "base.en"),
+        help="faster-whisper model size (default tiny.en)",
+    )
+    parser.add_argument(
+        "--query",
+        default=DEFAULT_QUERY,
+        help="fallback question when the transcript is empty",
+    )
+    parser.add_argument(
+        "--record-seconds",
+        type=float,
+        default=DEFAULT_RECORD_SECONDS,
+        help=f"microphone capture length (default {DEFAULT_RECORD_SECONDS:g})",
+    )
+    parser.add_argument(
+        "--no-tts",
+        action="store_true",
+        help="print the reply but skip speech synthesis",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="print per-stage detail",
+    )
     return parser
 
 
