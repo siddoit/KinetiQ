@@ -24,48 +24,25 @@ except ImportError:
     cv2 = None  # type: ignore
     np = None  # type: ignore
 
-# Emotion mapping for empathetic wellness coaching
+# 5 Clean Emotions Mapping: (descriptor, label, tone)
+EMOTION_DESCRIPTORS = {
+    "Neutral":   ("calm and settled", "Calm", "balanced"),
+    "Happiness": ("happy and upbeat", "Happy", "upbeat"),
+    "Surprise":  ("surprised and wide-eyed", "Surprised", "playfully curious and reassuring"),
+    "Sadness":   ("sad or a little low", "Sad", "extra gentle, warm, and comforting"),
+    "Anger":     ("angry or frustrated", "Angry", "calm, steady, and de-escalating"),
+    "Disgust":   ("angry or frustrated", "Angry", "calm, steady, and de-escalating"),
+    "Fear":      ("surprised and wide-eyed", "Surprised", "calm and reassuring"),
+    "Contempt":  ("calm and settled", "Calm", "balanced"),
+}
+
 EMOTION_WELLNESS_MAP = {
-    "Anger": {
-        "descriptor": "tense and stressed",
-        "label": "Tense / Stressed",
-        "tone": "de-escalating, calming, recommend box breathing or a short break",
-    },
-    "Fear": {
-        "descriptor": "anxious or overwhelmed",
-        "label": "Anxious / Overwhelmed",
-        "tone": "supportive, grounding, gentle pacing",
-    },
-    "Sadness": {
-        "descriptor": "fatigued and low-energy",
-        "label": "Fatigued / Low Energy",
-        "tone": "encouraging, restorative, gentle recovery advice",
-    },
-    "Disgust": {
-        "descriptor": "uncomfortable or strained",
-        "label": "Strained",
-        "tone": "check posture and physical comfort",
-    },
-    "Happiness": {
-        "descriptor": "upbeat, happy, and energized",
-        "label": "Upbeat / Energized",
-        "tone": "positive, encouraging, maintain healthy momentum",
-    },
-    "Surprise": {
-        "descriptor": "alert and engaged",
-        "label": "Alert / Engaged",
-        "tone": "informative, focused",
-    },
-    "Neutral": {
-        "descriptor": "calm and balanced",
-        "label": "Calm / Balanced",
-        "tone": "steady, standard wellness pacing",
-    },
-    "Contempt": {
-        "descriptor": "mildly tense",
-        "label": "Mildly Tense",
-        "tone": "relax shoulders, steady breathing",
-    },
+    k: {
+        "descriptor": v[0],
+        "label": v[1],
+        "tone": v[2],
+    }
+    for k, v in EMOTION_DESCRIPTORS.items()
 }
 
 _NEGATIVE_EMOTIONS = frozenset({"Anger", "Fear", "Sadness", "Disgust", "Contempt"})
@@ -80,6 +57,7 @@ def _neutral_result(face_detected: bool = False) -> Dict[str, Any]:
         "tone": mapping["tone"],
         "confidence": 1.0,
         "face_detected": face_detected,
+        "face_box": None,
         "timestamp": time.time(),
     }
 
@@ -143,6 +121,7 @@ class EmotionDetector:
         h, w = frame.shape[:2]
         face_roi = None
         face_detected = False
+        face_box = None
 
         # 1. Try Haar face detection with histogram equalization for dim rooms
         if self._cascade is not None and not self._cascade.empty():
@@ -150,14 +129,21 @@ class EmotionDetector:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 gray_eq = cv2.equalizeHist(gray)
                 faces = self._cascade.detectMultiScale(
-                    gray_eq, scaleFactor=1.12, minNeighbors=4, minSize=(36, 36)
+                    gray_eq, scaleFactor=1.25, minNeighbors=4, minSize=(36, 36)
                 )
                 if len(faces) == 0:
                     faces = self._cascade.detectMultiScale(
-                        gray, scaleFactor=1.15, minNeighbors=4, minSize=(36, 36)
+                        gray, scaleFactor=1.25, minNeighbors=4, minSize=(36, 36)
                     )
                 if len(faces) > 0:
                     fx, fy, fw, fh = max(faces, key=lambda b: b[2] * b[3])
+                    H, W = gray.shape[:2]
+                    face_box = {
+                        "cx": round((fx + fw * 0.5) / W, 4),
+                        "cy": round((fy + fh * 0.5) / H, 4),
+                        "w": round(fw / W, 4),
+                        "h": round(fh / H, 4),
+                    }
                     pad_x = int(fw * 0.1)
                     pad_y = int(fh * 0.1)
                     x1 = max(0, fx - pad_x)
@@ -168,6 +154,7 @@ class EmotionDetector:
                     face_detected = True
             except Exception:
                 face_roi = None
+                face_box = None
 
         # 2. If no face is detected by Haar Cascade, do NOT feed background wall
         # textures into EfficientNet as negative emotions (walls often classify
@@ -212,6 +199,7 @@ class EmotionDetector:
                     "tone": mapping.get("tone", "balanced"),
                     "confidence": round(conf, 3),
                     "face_detected": face_detected,
+                    "face_box": face_box,
                     "timestamp": time.time(),
                 }
                 self._last_result = result

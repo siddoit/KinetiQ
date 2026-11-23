@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KINETIQ Mirror</title>
+<link rel="stylesheet" href="/static/css/classic.css">
+</head>
+<body data-st="OFFLINE">
+<!-- freshness labels state observation only: "changed Ns ago" / "first seen Ns ago" / "no data Ns" -->
+<header>
+  <div class="brand">
+    <span class="mark" aria-hidden="true"></span>
+    <h1 class="wordmark">KINETIQ</h1>
+    <span class="tag">the mirror that sees and answers</span>
+  </div>
+  <div class="hud">
+    <a href="/" class="mode-btn" style="text-decoration:none;display:inline-flex;align-items:center;">Home Edition</a>
+    <div class="mode-switch" id="modeSwitch" title="Switch active source: Band 6 vs FreeRTOS">
+      <button id="btnModeBand" class="mode-btn active" onclick="setMode('band')">Band 6</button>
+      <button id="btnModeRtos" class="mode-btn rtos" onclick="setMode('rtos')">FreeRTOS</button>
+    </div>
+    <span class="chip">
+      <span id="lane" style="display:none">LANE</span>
+      <span class="sep" id="laneSep" style="display:none">&middot;</span>
+      <span id="src">...</span>
+    </span>
+    <span class="stpill" id="stChip">OFFLINE</span>
+    <span class="linkgrp">
+      <span class="badge" id="link">LINK</span>
+      <span id="stAge">waiting for first packet</span>
+      <span id="clock">--:--:--</span>
+    </span>
+  </div>
+</header>
+
+<main>
+  <section class="col left">
+    <!-- Hero: Live Heart Rate -->
+    <div class="zone hero" id="heroZone">
+      <div id="vals" class="dim">
+        <div class="hero-top">
+          <span class="eyebrow">Live vitals</span>
+          <span class="act" id="activity">REST</span>
+        </div>
+        <div class="hero-num num">
+          <span id="hr">--</span>
+          <div class="unit-stack">
+            <span class="pulse-heart" id="hrPulse" aria-hidden="true"></span>
+            <span class="unit">BPM</span>
+          </div>
+        </div>
+      </div>
+      <div class="age" id="ageH">no data yet</div>
+    </div>
+
+    <!-- Secondary Biometric & Activity Metrics -->
+    <div class="zone tiles">
+      <div class="head">
+        <span class="eyebrow">Secondary metrics</span>
+        <span class="age" id="ageM">no data yet</span>
+      </div>
+      <div id="vals2" class="dim">
+        <div class="tilegrid">
+          <div class="tile">
+            <span class="k">SpO<sub>2</sub> <small class="k-sub">%</small></span>
+            <span class="big" id="spo2">--</span>
+          </div>
+          <div class="tile">
+            <span class="k">Exertion</span>
+            <span class="big" id="ex">--</span>
+          </div>
+          <div class="tile">
+            <span class="k">Steps</span>
+            <span class="big" id="steps">--</span>
+          </div>
+          <div class="tile">
+            <span class="k">PPG Signal</span>
+            <span class="big" id="ppg">--</span>
+          </div>
+        </div>
+        <div class="motion">
+          <span class="k">Motion index</span>
+          <span class="bar"><span id="mbar"></span></span>
+          <span class="big num" id="mv">--</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Heart Rate Trend Sparkline -->
+    <div class="zone sparkcard">
+      <div class="head">
+        <span class="eyebrow">Heart rate history <small class="eyebrow-sub">(last 60 samples)</small></span>
+        <span class="age" id="ageS">no data yet</span>
+      </div>
+      <canvas id="spark" width="1200" height="140"></canvas>
+    </div>
+  </section>
+
+  <section class="col right">
+    <!-- Optical Presence & Emotion Sensing -->
+    <div class="zone mirror" id="mirror">
+      <div class="head">
+        <span class="eyebrow">The mirror sees you</span>
+        <span class="badge-row">
+          <span id="presBadge" class="pres-badge idle"><span class="dot"></span>No person detected</span>
+          <span id="emoBadge" class="pres-badge idle" style="display:none"><span class="dot"></span>Mood: --</span>
+        </span>
+      </div>
+      <div class="mirror-row">
+        <button id="camBtn" class="btn primary">Activate Camera Mirror</button>
+        <div class="cam-wrap" id="camWrap" style="display:none">
+          <video id="camVideo" autoplay playsinline muted style="display:none"></video>
+        </div>
+      </div>
+      <div class="pres-progress" id="presProgressWrap" aria-hidden="true">
+        <span class="pres-progress-fill" id="presBar"></span>
+      </div>
+      <div class="note" id="camMsg">Click above to start mirror camera presence recognition.</div>
+      <canvas id="camCanvas" width="64" height="48" style="display:none"></canvas>
+    </div>
+
+    <!-- Sensor-Grounded Voice & Text Assistant -->
+    <div class="zone chat" id="chat">
+      <div class="head">
+        <span class="eyebrow">Ask the mirror</span>
+        <span class="note">checked against live data</span>
+      </div>
+      <button id="chatToggle" class="tbtn" title="Collapse assistant" aria-expanded="true" aria-label="Collapse or expand the assistant">&#9662;</button>
+      <div id="msgs">
+        <div class="m assistant">
+          <span class="m-tag">KINETIQ</span>
+          <span class="m-body">I can see your live telemetry &mdash; ask me how you&rsquo;re doing.</span>
+        </div>
+      </div>
+      <div id="lastReply" title="I can see your live telemetry &mdash; ask me how you're doing.">I can see your live telemetry &mdash; ask me how you&rsquo;re doing.</div>
+      <div class="quick-row" id="quickRow">
+        <button type="button" class="qchip" onclick="sendText('How am I doing?')">How am I doing?</button>
+        <button type="button" class="qchip" onclick="sendText('How is my exertion and recovery?')">Recovery check</button>
+        <button type="button" class="qchip" onclick="sendText('Give me a quick breathing or posture tip.')">Breathing tip</button>
+      </div>
+      <div id="qin">
+        <input id="q" placeholder="How am I doing?" autocomplete="off">
+        <button id="mic" class="btn" title="Voice input (mic)">Mic</button>
+        <button id="spk" class="btn primary" title="Spoken replies on/off">Voice On</button>
+        <button id="send" class="btn primary">Send</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span class="disc" id="discText">Sensors simulated &middot; camera motion only &mdash; no video stored or uploaded</span>
+  <span class="diag"><span id="up">uptime --</span> &middot; <span id="rej">rejected frames --</span></span>
+</footer>
+<script src="/static/js/classic.js"></script>
+</body>
+</html>

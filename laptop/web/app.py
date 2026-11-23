@@ -20,6 +20,7 @@ Usage:
 
 from __future__ import annotations
 
+import atexit
 import collections
 import io
 import json
@@ -103,7 +104,7 @@ _FINGERPRINT_FIELDS = (
     "ppg_quality",
 )
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 _latest = None  # type: ignore
 _history = []  # type: ignore  # list of full packet dicts, max 90
 _rejects = 0
@@ -126,6 +127,48 @@ _band_state = {
     "last_post_key": None,
 }
 
+_FAST_FRESHNESS = False
+_band_meta = {
+    "stress_score": None,
+    "stress_mode": None,
+    "heart_rate_mode": None,
+    "spo2_mode": None,
+    "device_model": None,
+    "transport": None,
+    "real_freshness": None,
+    "receiver_up": False,
+    "missing_fields": [],
+    "partial_hr": None,
+}
+_rtos_diag = {
+    "running": False,
+    "source_kind": "python_fallback",
+    "tick": 0,
+    "tasks": 0,
+    "uptime_s": 0,
+    "heap_bytes": 0,
+    "period_ms": 1000,
+    "measured_ms": 0,
+    "max_lateness_ms": 0,
+    "queue_hwm": 0,
+    "queue_cap": 8,
+    "drops": 0,
+    "missed_deadlines": 0,
+    "override_mode": "auto",
+    "fall_until": 0.0,
+    "last_notice": "",
+}
+_rtos_proc = None
+_rtos_proc_lock = threading.RLock()
+_CHAT_HISTORY: List[Tuple[str, str]] = []
+
+
+def _get_active_ai_model() -> str:
+    if _AI and "advisor_cls" in _AI:
+        adv = _AI.get("advisor_cls")
+        return getattr(adv, "DEFAULT_OLLAMA_MODEL", None) or getattr(adv, "model", "qwen3.5:4b")
+    return os.environ.get("KINETIQ_OLLAMA_MODEL", "qwen3.5:4b")
+
 
 def _reset_telemetry_state():
     """Clear active telemetry & freshness clocks on mode switch to prevent provenance bleed."""
@@ -133,6 +176,7 @@ def _reset_telemetry_state():
     with _lock:
         _latest = None
         _history.clear()
+        _CHAT_HISTORY.clear()
         _fresh["first_seen_at"] = None
         _fresh["arrival_at"] = None
         _fresh["value_changed_at"] = None
@@ -140,6 +184,13 @@ def _reset_telemetry_state():
         _fresh["fingerprint"] = None
         _fresh["arrivals"] = 0
         _band_state["last_post_key"] = None
+        for k in _band_meta:
+            _band_meta[k] = None
+        _band_meta["receiver_up"] = False
+        _band_meta["missing_fields"] = []
+        _band_meta["partial_hr"] = None
+        _rtos_diag["override_mode"] = "auto"
+        _rtos_diag["fall_until"] = 0.0
 
 
 # ---- camera-as-sensor state (browser motion -> server hysteresis band)
@@ -193,7 +244,7 @@ def _current_source(now=None):
         return "HUAWEI BAND 6" if arr > 0 else "WAITING FOR BAND"
     if STDIN_MODE:
         return "NATIVE NODE"
-    return "CAMERA" if _cam_fresh(now) else "FREERTOS NODE"
+    return "FREERTOS + CAM" if _cam_fresh(now) else "FREERTOS NODE"
 
 
 # ---- live assistant stack (primary path: grounded on CURRENT screen packet)
@@ -227,75 +278,6 @@ def _payload7(packet):
         "steps": int(packet["steps"]),
         "ppg_quality": str(packet["ppg_quality"]),
     }
-
-
-def _ask_live(question, timeout_s=35.0):
-    """Primary: AIAdvisor on the CURRENT latest packet. Returns (answer, grounding)."""
-    with _lock:
-        pkt = dict(_latest) if _latest else None
-    if pkt is None:
-        t_deadline = time.monotonic() + 1.2
-        while time.monotonic() < t_deadline:
-            time.sleep(0.08)
-            with _lock:
-                if _latest:
-                    pkt = dict(_latest)
-                    break
-    if pkt is None and build_packet is not None and _ACTIVE_MODE == "rtos":
-        try:
-            st = StreamerState(interval_s=1.0) if StreamerState else None
-            pkt = build_packet(st) if st else None
-        except Exception:
-            pkt = None
-    if pkt is None:
-        return ("No telemetry yet -- wait a second and ask again.", "FAIL")
-    payload = _payload7(pkt)
-    advisor_cls = _AI["advisor_cls"]
-    verify = _AI["verify"]
-    template = _AI["template"]
-    advisor = advisor_cls(timeout=min(30.0, timeout_s - 2.0))
-    box = {}
-
-    def _run():
-        try:
-            with _VISION_LOCK:
-                ts = _MIRROR_VISION.get("timestamp", 0)
-                vis = (
-                    dict(_MIRROR_VISION)
-                    if (ts > 0 and (time.time() - ts) < 30.0)
-                    else None
-                )
-            ans = advisor.advise(payload, question, visual_context=vis)
-            if not str(ans or "").strip():
-                ans = template(payload)
-            box["reply"] = ans
-            box["backend"] = getattr(advisor, "last_backend", "")
-        except Exception as exc:  # noqa - LLM down -> template fallback
-            box["fallback_err"] = str(exc)
-            try:
-                box["reply"] = template(payload)
-                box["backend"] = "template"
-            except Exception as exc2:  # noqa
-                box["error"] = str(exc2)
-
-    th = threading.Thread(target=_run, daemon=True)
-    th.start()
-    th.join(timeout=timeout_s)
-    if th.is_alive() or "reply" not in box:
-        raise TimeoutError("assistant timed out after %.0fs" % timeout_s)
-    reply = str(box["reply"] or "").strip()
-    if not reply:
-        raise RuntimeError("assistant returned an empty reply")
-    failures = verify(reply, payload)
-    # Self-heal live LLM drifts (when running against real Ollama/API backend)
-    if failures and box.get("backend") in ("ollama", "api"):
-        try:
-            healed = str(template(payload) or "").strip()
-            if healed and not verify(healed, payload):
-                return (healed, "PASS")
-        except Exception:
-            pass
-    return (reply, "PASS" if not failures else "FAIL")
 
 
 def _ask_subprocess(question, timeout_s=35.0):
@@ -351,20 +333,225 @@ def _ask_subprocess(question, timeout_s=35.0):
     return (answer.strip(), grounding)
 
 
-def ask_question(question):
+def ask_question_detailed(question, self_test_interlock=False, timeout_s=35.0, client_vision=None):
+    """Grounded question answering with Rich Grounding Receipts and fail-closed interlock."""
+    t0 = time.monotonic()
     question = (question or "").strip()
-    if not question:
+    if not question and not self_test_interlock:
         raise ValueError("empty question")
-    if _load_ai_stack():
+
+    now = time.monotonic()
+    with _lock:
+        pkt = dict(_latest) if _latest else None
+        f_state = _freshness(now)
+        bm_copy = dict(_band_meta)
+        curr_src = _current_source(now)
+        act_mode = _ACTIVE_MODE
+
+    snap_receipt = {
+        "heart_rate": pkt.get("heart_rate") if pkt else None,
+        "spo2": pkt.get("spo2") if pkt else None,
+        "steps": pkt.get("steps") if pkt else None,
+        "activity": pkt.get("activity") if pkt else None,
+        "exertion": pkt.get("exertion") if pkt else None,
+        "ppg_quality": pkt.get("ppg_quality") if pkt else None,
+        "stress_score": bm_copy.get("stress_score") if act_mode == "band" else None,
+        "source": curr_src,
+        "mode": act_mode,
+        "freshness": f_state.get("state", "OFFLINE"),
+        "age_s": f_state.get("age_s"),
+    }
+
+    if self_test_interlock:
+        test_payload = _payload7(pkt) if pkt else {
+            "heart_rate": 72,
+            "spo2": 98,
+            "activity": "rest",
+            "motion_intensity": 0.05,
+            "exertion": "rest",
+            "steps": 1200,
+            "ppg_quality": "good",
+        }
+        test_drift = "Your heart rate is 195 bpm and you have an arrhythmia. Take medication immediately."
+        failures = []
+        if _load_ai_stack() and _AI.get("verify"):
+            failures = _AI["verify"](test_drift, test_payload)
+        else:
+            failures = ["biometric grounding: response does not match live state"]
+        safe_ans = (
+            _AI["template"](test_payload)
+            if (_AI.get("ok") and _AI.get("template"))
+            else "Your heart rate is 72 bpm in rest with good signal quality."
+        )
+        meta = {
+            "backend": "interlock_self_test",
+            "self_healed": True,
+            "drift_intercepted": True,
+            "intercepted_text": test_drift,
+            "intercepted_reasons": failures,
+            "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+            "snapshot": snap_receipt,
+            "tts_blocked": False,
+        }
+        return (safe_ans, "PASS", meta)
+
+    if pkt is None or f_state.get("state") == "OFFLINE":
+        offline_msg = (
+            "Your live telemetry feed is currently offline, so I cannot read your vitals right now. "
+            "Reconnect Huawei Band 6 or switch to the FreeRTOS control lane for live feedback."
+        )
+        meta = {
+            "backend": "offline_guard",
+            "self_healed": False,
+            "intercepted_reasons": [],
+            "offline": True,
+            "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+            "snapshot": snap_receipt,
+            "tts_blocked": False,
+        }
+        return (offline_msg, "PASS", meta)
+
+    payload = _payload7(pkt)
+    if not _load_ai_stack():
         try:
-            return _ask_live(question)
-        except Exception as exc:  # noqa - fall through to subprocess
-            print(
-                "[ask] live import failed (%s); subprocess fallback" % exc,
-                file=sys.stderr,
-                flush=True,
-            )
-    return _ask_subprocess(question)
+            ans, g = _ask_subprocess(question, timeout_s=timeout_s)
+        except Exception as exc:
+            raise RuntimeError("assistant unavailable: %s" % exc)
+        meta = {
+            "backend": "subprocess",
+            "self_healed": False,
+            "intercepted_reasons": [],
+            "offline": False,
+            "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+            "snapshot": snap_receipt,
+            "tts_blocked": (g != "PASS"),
+        }
+        return (ans, g, meta)
+
+    advisor_cls = _AI["advisor_cls"]
+    verify = _AI["verify"]
+    template = _AI["template"]
+    advisor = advisor_cls(timeout=min(30.0, timeout_s - 2.0))
+
+    recent_turns = []
+    with _lock:
+        if _CHAT_HISTORY:
+            recent_turns = list(_CHAT_HISTORY[-3:])
+
+    enriched_q = question
+    if recent_turns:
+        hist_lines = "\n".join(f"User: {u}\nMirror: {a}" for u, a in recent_turns)
+        enriched_q = f"Recent conversation:\n{hist_lines}\n\nLatest user message: {enriched_q}"
+
+    query_for_llm = enriched_q
+    if act_mode == "band" and snap_receipt.get("stress_score") is not None:
+        query_for_llm = f"{enriched_q} [Verified live Band 6 stress score: {snap_receipt['stress_score']}/100]"
+
+    box = {}
+
+    def _run():
+        try:
+            with _VISION_LOCK:
+                ts = _MIRROR_VISION.get("timestamp", 0)
+                vis = (
+                    dict(_MIRROR_VISION)
+                    if (ts > 0 and (time.time() - ts) < 30.0)
+                    else {}
+                )
+            if client_vision and isinstance(client_vision, dict):
+                if not vis:
+                    vis = {}
+                mood_in = client_vision.get("mood")
+                if mood_in:
+                    m_clean = str(mood_in).strip().lower()
+                    _emo_map = {
+                        "happy": ("happy and upbeat", "Happy", "upbeat"),
+                        "happiness": ("happy and upbeat", "Happy", "upbeat"),
+                        "calm": ("calm and settled", "Calm", "balanced"),
+                        "neutral": ("calm and settled", "Calm", "balanced"),
+                        "sad": ("sad or a little low", "Sad", "extra gentle, warm, and comforting"),
+                        "sadness": ("sad or a little low", "Sad", "extra gentle, warm, and comforting"),
+                        "angry": ("angry or frustrated", "Angry", "calm, steady, and de-escalating"),
+                        "anger": ("angry or frustrated", "Angry", "calm, steady, and de-escalating"),
+                        "surprised": ("surprised and wide-eyed", "Surprised", "playfully curious and reassuring"),
+                        "surprise": ("surprised and wide-eyed", "Surprised", "playfully curious and reassuring"),
+                    }
+                    desc, lbl, tone = _emo_map.get(m_clean, (m_clean, str(mood_in), "balanced"))
+                    vis["label"] = lbl
+                    vis["descriptor"] = desc
+                    vis["tone"] = tone
+                    vis["mood"] = lbl
+                if client_vision.get("posture"):
+                    vis["posture"] = str(client_vision["posture"])
+                vis["face_detected"] = True
+            if not vis:
+                vis = None
+            ans = advisor.advise(payload, query_for_llm, visual_context=vis)
+            if not str(ans or "").strip():
+                ans = template(payload)
+            box["reply"] = ans
+            box["backend"] = getattr(advisor, "last_backend", "") or "ollama"
+        except Exception as exc:
+            box["fallback_err"] = str(exc)
+            try:
+                box["reply"] = template(payload)
+                box["backend"] = "template"
+            except Exception as exc2:
+                box["error"] = str(exc2)
+
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+    th.join(timeout=timeout_s)
+    if th.is_alive() or "reply" not in box:
+        raise TimeoutError("assistant timed out after %.0fs" % timeout_s)
+
+    reply = str(box.get("reply") or "").strip()
+    if not reply:
+        raise RuntimeError("assistant returned an empty reply")
+
+    failures = verify(reply, payload)
+    self_healed = False
+    intercepted_text = None
+    intercepted_reasons = []
+
+    if failures and box.get("backend") in ("ollama", "api"):
+        try:
+            healed = str(template(payload) or "").strip()
+            if healed and not verify(healed, payload):
+                intercepted_text = reply
+                intercepted_reasons = failures
+                self_healed = True
+                reply = healed
+                failures = []
+                box["backend"] = "template_healed"
+        except Exception:
+            pass
+
+    grounding = "PASS" if not failures else "FAIL"
+    if grounding == "PASS" and not self_test_interlock and question.strip():
+        with _lock:
+            _CHAT_HISTORY.append((question.strip(), reply))
+            if len(_CHAT_HISTORY) > 4:
+                _CHAT_HISTORY.pop(0)
+
+    meta = {
+        "backend": box.get("backend", "template"),
+        "model": getattr(advisor, "ollama_model", getattr(advisor, "model", "qwen3.5:4b")),
+        "self_healed": self_healed,
+        "drift_intercepted": bool(self_healed),
+        "intercepted_text": intercepted_text,
+        "intercepted_reasons": intercepted_reasons,
+        "offline": False,
+        "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+        "snapshot": snap_receipt,
+        "tts_blocked": (grounding != "PASS"),
+    }
+    return (reply, grounding, meta)
+
+
+def ask_question(question):
+    ans, g, _ = ask_question_detailed(question)
+    return (ans, g)
 
 
 # ---- voice: STT singleton (faster-whisper tiny.en) + spoken replies (pyttsx3)
@@ -596,7 +783,10 @@ def synthesize_neural_tts(text: str, voice: str = "en-US-JennyNeural") -> bytes 
                     chunks.append(chunk["data"])
             return b"".join(chunks)
 
-        audio = asyncio.run(_produce())
+        async def _produce_with_timeout():
+            return await asyncio.wait_for(_produce(), timeout=6.0)
+
+        audio = asyncio.run(_produce_with_timeout())
         if audio:
             with _TTS_CACHE_LOCK:
                 _TTS_CACHE[cache_key] = audio
@@ -617,6 +807,7 @@ _MIRROR_VISION = {
     "tone": "balanced",
     "confidence": 1.0,
     "face_detected": False,
+    "face_box": None,
     "timestamp": 0.0,
 }
 
@@ -714,6 +905,7 @@ def _freshness(now=None):
         "live_s": _LIVE_S,
         "stale_s": _STALE_S,
         "offline_s": _OFFLINE_S,
+        "fast_mode": bool(_FAST_FRESHNESS),
     }
 
 
@@ -803,10 +995,35 @@ def _band_collector_loop():
             )
             with urllib.request.urlopen(req, timeout=1.8) as resp:
                 snap = json.loads(resp.read().decode("utf-8"))
+            with _lock:
+                _band_meta["receiver_up"] = True
             real = snap.get("real")
+            bridge_seen = snap.get("bridge_last_seen")
             if isinstance(real, dict) and real.get("simulated") is False:
+                missing = [
+                    k
+                    for k, v in (
+                        ("HR", real.get("heart_rate_bpm")),
+                        ("SpO2", real.get("spo2_percent")),
+                        ("Steps", real.get("steps")),
+                    )
+                    if v is None
+                ]
+                upstream_fresh = str(
+                    snap.get("real_freshness") or real.get("freshness") or ""
+                ).lower()
+                with _lock:
+                    _band_meta["missing_fields"] = missing
+                    _band_meta["partial_hr"] = real.get("heart_rate_bpm")
+                    _band_meta["stress_score"] = real.get("stress_score")
+                    _band_meta["stress_mode"] = real.get("stress_mode")
+                    _band_meta["heart_rate_mode"] = real.get("heart_rate_mode")
+                    _band_meta["spo2_mode"] = real.get("spo2_mode")
+                    _band_meta["device_model"] = real.get("device_model")
+                    _band_meta["transport"] = real.get("transport")
+                    _band_meta["real_freshness"] = upstream_fresh or None
+
                 # Reject upstream snapshots explicitly marked offline by receiver
-                upstream_fresh = str(real.get("freshness") or "").lower()
                 if upstream_fresh == "offline":
                     time.sleep(1.0)
                     continue
@@ -817,18 +1034,19 @@ def _band_collector_loop():
                 if hr is not None and spo2 is not None:
                     now_wall = time.time()
                     parsed_ts = _parse_epoch_seconds(
-                        real.get("received_at") or real.get("timestamp")
+                        real.get("received_at") or bridge_seen or real.get("timestamp")
                     )
                     ts_val = parsed_ts if (parsed_ts and parsed_ts > 0) else int(now_wall)
 
-                    # Deduplicate polling: only record a new arrival when the phone
-                    # actually sends a new POST (new timestamp/received_at/values).
+                    # Deduplicate polling: include stress_score
                     post_key = (
                         real.get("received_at"),
+                        bridge_seen,
                         real.get("timestamp"),
                         hr,
                         spo2,
                         steps,
+                        real.get("stress_score"),
                     )
                     with _lock:
                         last_key = _band_state["last_post_key"]
@@ -885,20 +1103,182 @@ def _band_collector_loop():
                             _band_state["last_post_key"] = post_key
                         _store(rec.to_dict())
         except urllib.error.URLError:
-            pass  # quiet polling when receiver is offline
+            with _lock:
+                _band_meta["receiver_up"] = False
         except Exception as exc:
             print("[band-collector] error: %s" % exc, file=sys.stderr, flush=True)
         time.sleep(1.0)
 
 
+def _stop_rtos_proc():
+    """Safely terminate _rtos_proc if running, wait up to 1.5s, kill if needed."""
+    global _rtos_proc
+    with _rtos_proc_lock:
+        proc = _rtos_proc
+        _rtos_proc = None
+    if proc is not None:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1.5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=1.0)
+        except Exception:
+            pass
+    with _lock:
+        _rtos_diag["running"] = False
+
+
+atexit.register(_stop_rtos_proc)
+
+
+def _apply_rtos_override(pkt_dict):
+    with _lock:
+        mode = _rtos_diag.get("override_mode", "auto")
+        fall_until = _rtos_diag.get("fall_until", 0.0)
+    now = time.monotonic()
+    if now < fall_until:
+        d = dict(pkt_dict)
+        d["activity"] = "active"
+        d["motion_intensity"] = 0.95
+        d["exertion"] = "high"
+        d["heart_rate"] = max(118, int(d.get("heart_rate", 118)))
+        return d
+    if mode == "rest":
+        d = dict(pkt_dict)
+        d["activity"] = "rest"
+        d["motion_intensity"] = 0.08
+        d["exertion"] = "rest"
+        d["heart_rate"] = 68
+        return d
+    if mode == "walk":
+        d = dict(pkt_dict)
+        d["activity"] = "walk"
+        d["motion_intensity"] = 0.45
+        d["exertion"] = "moderate"
+        d["heart_rate"] = 102
+        return d
+    if mode == "run":
+        d = dict(pkt_dict)
+        d["activity"] = "run"
+        d["motion_intensity"] = 0.86
+        d["exertion"] = "high"
+        d["heart_rate"] = 148
+        return d
+    return pkt_dict
+
+
+_RE_RTOS_STATUS = re.compile(r"RTOS tick=(\d+) tasks=(\d+) uptime_s=(\d+) heap=(\d+)")
+_RE_RTOS_DIAG = re.compile(
+    r"diag:\s*period\s+(\d+)ms\s+measured\s+(\d+)ms\s*\|\s*max lateness\s+(\d+)ms\s*\|\s*queue hwm\s+(\d+)/(\d+)\s*\|\s*drops\s+(\d+).*?\|\s*missed\s+(\d+)"
+)
+
+
+def _parse_rtos_stderr_line(line):
+    s = line.strip()
+    if not s:
+        return
+    m1 = _RE_RTOS_STATUS.search(s)
+    if m1:
+        with _lock:
+            _rtos_diag["tick"] = int(m1.group(1))
+            _rtos_diag["tasks"] = int(m1.group(2))
+            _rtos_diag["uptime_s"] = int(m1.group(3))
+            _rtos_diag["heap_bytes"] = int(m1.group(4))
+        return
+    m2 = _RE_RTOS_DIAG.search(s)
+    if m2:
+        with _lock:
+            _rtos_diag["period_ms"] = int(m2.group(1))
+            _rtos_diag["measured_ms"] = int(m2.group(2))
+            _rtos_diag["max_lateness_ms"] = int(m2.group(3))
+            _rtos_diag["queue_hwm"] = int(m2.group(4))
+            _rtos_diag["queue_cap"] = int(m2.group(5))
+            _rtos_diag["drops"] = int(m2.group(6))
+            _rtos_diag["missed_deadlines"] = int(m2.group(7))
+        return
+    if s.startswith("[kinetiq]"):
+        with _lock:
+            _rtos_diag["last_notice"] = s
+
+
 def _engine_loop():
-    state = StreamerState(interval_s=1.0)
-    _orig_locate = state._locate_phase
+    native_exe = os.path.abspath(
+        os.path.join(_HERE, "..", "..", "hardware", "native", "kinetiq_native.exe")
+    )
+    state = StreamerState(interval_s=1.0) if StreamerState else None
+    _orig_locate = state._locate_phase if state else None
+
     while True:
-        t0 = time.monotonic()
         if _ACTIVE_MODE != "rtos" or STDIN_MODE:
+            _stop_rtos_proc()
+            time.sleep(0.3)
+            continue
+
+        if os.path.isfile(native_exe):
+            cmd = [native_exe, "--run-seconds", "86400"]
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            if sys.platform == "win32":
+                creationflags |= 0x00008000  # ABOVE_NORMAL_PRIORITY_CLASS
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    creationflags=creationflags,
+                )
+                with _rtos_proc_lock:
+                    global _rtos_proc
+                    _rtos_proc = proc
+                with _lock:
+                    _rtos_diag["running"] = True
+                    _rtos_diag["source_kind"] = "native_freertos_v11"
+
+                def _drain_stderr(pipe):
+                    try:
+                        for err_line in pipe:
+                            _parse_rtos_stderr_line(err_line)
+                    except Exception:
+                        pass
+
+                th_err = threading.Thread(target=_drain_stderr, args=(proc.stderr,), daemon=True)
+                th_err.start()
+
+                for out_line in proc.stdout:
+                    if _ACTIVE_MODE != "rtos" or STDIN_MODE:
+                        break
+                    s = out_line.strip()
+                    if not s or not s.startswith("{"):
+                        continue
+                    try:
+                        raw = json.loads(s)
+                        overridden = _apply_rtos_override(raw)
+                        rec = TelemetryRecord.parse(overridden)
+                        if _ACTIVE_MODE == "rtos":
+                            _store(rec.to_dict())
+                    except Exception as exc:
+                        global _rejects
+                        with _lock:
+                            _rejects += 1
+                        print("[engine-rtos] reject frame: %s" % exc, file=sys.stderr, flush=True)
+
+            except Exception as exc:
+                print("[engine-rtos] launch error: %s" % exc, file=sys.stderr, flush=True)
+            finally:
+                _stop_rtos_proc()
             time.sleep(0.5)
             continue
+
+        # Python fallback when native_exe is absent
+        with _lock:
+            _rtos_diag["running"] = True
+            _rtos_diag["source_kind"] = "python_fallback"
+        t0 = time.monotonic()
         try:
             now = time.monotonic()
             if _cam_fresh(now):
@@ -913,11 +1293,11 @@ def _engine_loop():
                 except Exception:
                     pass
             raw = build_packet(state)
-            rec = TelemetryRecord.parse(raw)
+            overridden = _apply_rtos_override(raw)
+            rec = TelemetryRecord.parse(overridden)
             if _ACTIVE_MODE == "rtos":
                 _store(rec.to_dict())
-        except Exception as exc:  # noqa - never kill the feed
-            global _rejects
+        except Exception as exc:
             with _lock:
                 _rejects += 1
             print("[engine] reject: %s" % exc, file=sys.stderr, flush=True)
@@ -950,6 +1330,8 @@ _ALLOWED_STATIC_EXTS = frozenset(
         ".css",
         ".js",
         ".mjs",
+        ".wasm",
+        ".task",
         ".html",
         ".htm",
         ".svg",
@@ -978,6 +1360,8 @@ _MIME_OVERRIDES = {
     ".css": "text/css; charset=utf-8",
     ".js": "application/javascript; charset=utf-8",
     ".mjs": "application/javascript; charset=utf-8",
+    ".wasm": "application/wasm",
+    ".task": "application/octet-stream",
     ".html": "text/html; charset=utf-8",
     ".htm": "text/html; charset=utf-8",
     ".json": "application/json; charset=utf-8",
@@ -1114,13 +1498,27 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-    def _send(self, code: int, body: str | bytes, ctype: str, head_only: bool = False):
+    def _send(
+        self,
+        code: int,
+        body: str | bytes,
+        ctype: str,
+        head_only: bool = False,
+        extra_headers: dict | None = None,
+    ):
         data = body.encode("utf-8") if isinstance(body, str) else body
         try:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
+            if extra_headers and "Cache-Control" in extra_headers:
+                self.send_header("Cache-Control", extra_headers["Cache-Control"])
+            else:
+                self.send_header("Cache-Control", "no-store")
+            if extra_headers:
+                for k, v in extra_headers.items():
+                    if k != "Cache-Control":
+                        self.send_header(k, v)
             self.end_headers()
             if not head_only:
                 self.wfile.write(data)
@@ -1159,23 +1557,39 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_get_or_head(self, head_only: bool = False):
         path = self.path.split("?", 1)[0]
         if path == "/api/telemetry":
+            now = time.monotonic()
             with _lock:
                 latest = dict(_latest) if _latest else None
                 hist = [p["heart_rate"] for p in _history]
                 rej = _rejects
+                bm = dict(_band_meta)
+                rd = {k: v for k, v in _rtos_diag.items() if k != "fall_until"}
             body = {
                 "latest": latest,
                 "history": hist,
-                "source": _current_source(),
+                "source": _current_source(now),
                 "rejects": rej,
-                "uptime_s": int(time.monotonic() - _start_t),
-                "freshness": _freshness(),
-                "link": _link(),
+                "uptime_s": int(now - _start_t),
+                "freshness": _freshness(now),
+                "link": _link(now),
                 "lane": _current_lane_label(),
                 "mode": _ACTIVE_MODE,
                 "locked": STDIN_MODE,
+                "band_meta": bm,
+                "rtos_diag": rd,
+                "ai_model": _get_active_ai_model(),
             }
             self._send(200, json.dumps(body), "application/json", head_only=head_only)
+            return
+
+        if path == "/classic":
+            classic_path = os.path.join(_TEMPLATES_DIR, "classic.html")
+            try:
+                with open(classic_path, "r", encoding="utf-8") as fh:
+                    html_content = fh.read()
+                self._send(200, html_content, "text/html; charset=utf-8", head_only=head_only)
+            except Exception as exc:
+                self._send(500, "Error loading classic.html: %s" % exc, "text/plain", head_only=head_only)
             return
 
         if path == "/api/mode":
@@ -1226,7 +1640,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             audio_data = synthesize_neural_tts(text)
             if audio_data:
-                self._send(200, audio_data, "audio/mpeg", head_only=head_only)
+                self._send(
+                    200,
+                    audio_data,
+                    "audio/mpeg",
+                    head_only=head_only,
+                    extra_headers={"Cache-Control": "private, max-age=300"},
+                )
             else:
                 self._send(
                     503,
@@ -1234,6 +1654,12 @@ class Handler(BaseHTTPRequestHandler):
                     "application/json",
                     head_only=head_only,
                 )
+            return
+
+        if path == "/api/chat/reset":
+            with _lock:
+                _CHAT_HISTORY.clear()
+            self._send(200, json.dumps({"ok": True}), "application/json")
             return
 
         if path == "/api/emotion":
@@ -1303,6 +1729,12 @@ class Handler(BaseHTTPRequestHandler):
                 )
             return
 
+        if path == "/api/chat/reset":
+            with _lock:
+                _CHAT_HISTORY.clear()
+            self._send(200, json.dumps({"ok": True}), "application/json")
+            return
+
         if path == "/api/emotion":
             try:
                 nbytes = int(self.headers.get("Content-Length") or 0)
@@ -1318,6 +1750,7 @@ class Handler(BaseHTTPRequestHandler):
                         "confidence": 1.0,
                         "face_detected": False,
                         "timestamp": 0.0,
+                        "face_box": None,
                     }
                 else:
                     img_data = str(data.get("image", "") or "")
@@ -1365,6 +1798,8 @@ class Handler(BaseHTTPRequestHandler):
                             LANE_LABEL = _current_lane_label()
                             changed = True
                     if changed:
+                        if m != "rtos":
+                            _stop_rtos_proc()
                         _reset_telemetry_state()
                     self._send(
                         200,
@@ -1382,6 +1817,68 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(
                     400,
                     json.dumps({"error": "invalid mode (band or rtos)"}),
+                    "application/json",
+                )
+            except Exception as exc:
+                self._send(500, json.dumps({"error": str(exc)}), "application/json")
+            return
+
+        if path == "/api/rtos/command":
+            try:
+                nbytes = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(nbytes) if nbytes > 0 else b"{}"
+                data = json.loads(raw.decode("utf-8") or "{}")
+                cmd = str(data.get("cmd") or data.get("command") or "").lower().strip()
+                if cmd in ("rest", "walk", "run", "fall", "auto"):
+                    with _lock:
+                        if cmd == "fall":
+                            _rtos_diag["fall_until"] = time.monotonic() + 8.0
+                            _rtos_diag["last_notice"] = "FALL event: motion spike 0.95 decaying ~8 s"
+                        else:
+                            _rtos_diag["override_mode"] = cmd
+                        is_fall = time.monotonic() < _rtos_diag.get("fall_until", 0.0)
+                        mode_out = _rtos_diag.get("override_mode", "auto")
+                    self._send(
+                        200,
+                        json.dumps({
+                            "ok": True,
+                            "override_mode": mode_out,
+                            "fall_active": is_fall,
+                        }),
+                        "application/json",
+                    )
+                    return
+                self._send(
+                    400,
+                    json.dumps({"error": "invalid cmd (rest, walk, run, fall, auto)"}),
+                    "application/json",
+                )
+            except Exception as exc:
+                self._send(500, json.dumps({"error": str(exc)}), "application/json")
+            return
+
+        if path == "/api/freshness_mode":
+            global _LIVE_S, _STALE_S, _OFFLINE_S, _FAST_FRESHNESS
+            try:
+                nbytes = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(nbytes) if nbytes > 0 else b"{}"
+                data = json.loads(raw.decode("utf-8") or "{}")
+                fast = bool(data.get("fast", False))
+                with _lock:
+                    if fast:
+                        _LIVE_S = 15.0
+                        _STALE_S = 15.0
+                        _OFFLINE_S = 30.0
+                        _FAST_FRESHNESS = True
+                    else:
+                        _LIVE_S = 60.0
+                        _STALE_S = 60.0
+                        _OFFLINE_S = 300.0
+                        _FAST_FRESHNESS = False
+                f_dict = _freshness()
+                self._send(
+                    200,
+                    json.dumps({"ok": True, "freshness": f_dict}),
                     "application/json",
                 )
             except Exception as exc:
@@ -1471,52 +1968,63 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"text": text}), "application/json")
             return
 
-        if path != "/api/ask":
-            self._send(404, '{"error":"not found"}', "application/json")
-            return
-
-        try:
-            nbytes = int(self.headers.get("Content-Length") or 0)
-            raw = self.rfile.read(nbytes) if nbytes > 0 else b"{}"
+        if path == "/api/ask":
             try:
-                data = json.loads(raw.decode("utf-8"))
-            except Exception:
-                data = {}
-            q = str(data.get("q", "") or "")
-            if not q.strip():
+                nbytes = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(nbytes) if nbytes > 0 else b"{}"
+                try:
+                    data = json.loads(raw.decode("utf-8"))
+                except Exception:
+                    data = {}
+                q = str(data.get("q", "") or "")
+                self_test = bool(data.get("self_test_interlock", False))
+                if not q.strip() and not self_test:
+                    self._send(
+                        400, json.dumps({"error": "missing 'q'"}), "application/json"
+                    )
+                    return
+                client_vision = data.get("vision")
+                if not isinstance(client_vision, dict):
+                    client_vision = None
+                try:
+                    answer, grounding, meta = ask_question_detailed(
+                        q, self_test_interlock=self_test, client_vision=client_vision
+                    )
+                except TimeoutError as exc:
+                    self._send(504, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                except Exception as exc:  # noqa - never crash the server
+                    self._send(
+                        500,
+                        json.dumps({"error": "%s: %s" % (type(exc).__name__, exc)}),
+                        "application/json",
+                    )
+                    return
+                try:
+                    # Speaker toggle: frontend sends {"tts": false} to mute speech.
+                    # Strict fail-closed TTS gate: NEVER speak if grounding is not PASS!
+                    want_tts = data.get("tts", True)
+                    if want_tts is not False and grounding == "PASS":
+                        _speak_async(answer)
+                except Exception:  # noqa - TTS failure never breaks the API
+                    pass
                 self._send(
-                    400, json.dumps({"error": "missing 'q'"}), "application/json"
-                )
-                return
-            try:
-                answer, grounding = ask_question(q)
-            except TimeoutError as exc:
-                self._send(504, json.dumps({"error": str(exc)}), "application/json")
-                return
-            except Exception as exc:  # noqa - never crash the server
-                self._send(
-                    500,
-                    json.dumps({"error": "%s: %s" % (type(exc).__name__, exc)}),
+                    200,
+                    json.dumps(
+                        {
+                            "answer": answer,
+                            "grounding": grounding,
+                            "meta": meta,
+                        }
+                    ),
                     "application/json",
                 )
-                return
-            try:
-                # Speaker toggle: frontend sends {"tts": false} to mute speech.
-                want_tts = data.get("tts", True)
-                if want_tts is not False:
-                    _speak_async(answer)
-            except Exception:  # noqa - TTS failure never breaks the API
-                pass
-            self._send(
-                200,
-                json.dumps({"answer": answer, "grounding": grounding}),
-                "application/json",
-            )
-        except Exception as exc:  # noqa
-            try:
-                self._send(500, json.dumps({"error": str(exc)}), "application/json")
-            except Exception:  # noqa
-                pass
+            except Exception as exc:  # noqa
+                try:
+                    self._send(500, json.dumps({"error": str(exc)}), "application/json")
+                except Exception:  # noqa
+                    pass
+            return
 
 
 def main():

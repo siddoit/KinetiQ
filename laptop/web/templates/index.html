@@ -1,157 +1,357 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>KINETIQ Mirror</title>
-<link rel="stylesheet" href="/static/css/style.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KinetiQ — Smart Mirror / Home Edition</title>
+  <link rel="stylesheet" href="/static/css/style.css">
 </head>
-<body data-st="OFFLINE">
-<!-- freshness labels state observation only: "changed Ns ago" / "first seen Ns ago" / "no data Ns" -->
-<header>
-  <div class="brand">
-    <span class="mark" aria-hidden="true"></span>
-    <h1 class="wordmark">KINETIQ</h1>
-    <span class="tag">the mirror that sees and answers</span>
+<body data-st="OFFLINE" data-mode="band">
+  <div class="app-shell">
+    <!-- ==================== SLIM TOP HEADER ==================== -->
+    <header class="topbar">
+      <div class="brand-group">
+        <div class="brand-ring" aria-hidden="true">
+          <span class="brand-dot"></span>
+        </div>
+        <div class="brand-text">
+          <h1 class="brand-name">KinetiQ</h1>
+          <div class="brand-sub">SMART MIRROR / HOME EDITION</div>
+        </div>
+      </div>
+
+      <div class="header-right">
+        <span class="header-phrase" id="headerPhrase">A moment to check in with yourself.</span>
+        <span class="header-clock" id="clock">--:--</span>
+
+        <div class="lane-pill" id="lanePill" title="Switch active telemetry lane">
+          <span class="lane-dot" id="laneDot"></span>
+          <button type="button" class="lane-opt active" id="btnModeBand" data-mode="band">Band 6</button>
+          <span class="lane-sep">/</span>
+          <button type="button" class="lane-opt" id="btnModeRtos" data-mode="rtos">FreeRTOS</button>
+        </div>
+
+        <button type="button" class="quiet-btn" id="spkBtn" title="Toggle spoken replies" aria-pressed="true">
+          <span id="spkLabel">Voice On</span>
+        </button>
+
+        <a href="/classic" class="quiet-btn" title="Open classic telemetry dashboard">Classic &#8599;</a>
+      </div>
+    </header>
+
+    <!-- ==================== MAIN 2-COLUMN HERO (FITS 100%) ==================== -->
+    <main class="main-grid">
+      <!-- LEFT HERO: LIVE MIRRORED CAMERA -->
+      <section class="mirror-stage" id="mirrorStage" aria-label="Smart Mirror Live Camera">
+        <video id="camVideo" class="mirror-video" autoplay playsinline muted></video>
+        <canvas id="camCanvas" width="64" height="48" hidden></canvas>
+
+        <div class="mirror-matte" id="mirrorMatte">
+          <div class="matte-aura"></div>
+          <div class="matte-copy">
+            <div class="matte-title" id="matteTitle">Mirror camera on standby</div>
+            <div class="matte-sub" id="matteSub">Enable camera for live reflection, presence check-in, and mood sensing.</div>
+            <button type="button" class="ref-btn" id="camActivateBtn">Enable preview</button>
+          </div>
+        </div>
+
+        <canvas id="constellationCanvas" class="constellation-layer" aria-hidden="true"></canvas>
+        <div class="bpm-aura" id="bpmAura" aria-hidden="true"></div>
+
+        <!-- Top Floating Frosted Pills (Exact Reference Placement) -->
+        <div class="mirror-top-bar">
+          <div class="frosted-pill" id="previewPill">
+            <span class="pill-dot" id="previewDot"></span>
+            <span id="previewText">CAMERA STANDBY</span>
+          </div>
+          <div class="frosted-pill source-pill" id="sourcePill">
+            <span id="sourcePillText">WAITING FOR BAND 6</span>
+          </div>
+        </div>
+
+        <!-- Bottom Vignette: Calm Greeting + Voice Orb + Hide preview -->
+        <div class="mirror-bottom-bar">
+          <div class="greeting-block">
+            <div class="greeting-eyebrow" id="greetingEyebrow">YOUR SPACE &middot; YOUR PACE</div>
+            <div class="greeting-title" id="greetingTitle">Good to see you.</div>
+            <div class="presence-track" id="presenceTrack" aria-hidden="true">
+              <div class="presence-fill" id="presBar"></div>
+            </div>
+          </div>
+
+          <div class="mirror-controls">
+            <div class="orb-cluster">
+              <div class="orb-status-pill" id="orbStatusPill" hidden>
+                <span class="orb-stage-dot"></span>
+                <span id="orbStatusText">Listening...</span>
+              </div>
+              <button
+                type="button"
+                class="voice-orb-btn"
+                id="voiceOrbBtn"
+                data-state="idle"
+                title="Speak to KinetiQ (or press Space)"
+                aria-label="Speak to KinetiQ"
+              >
+                <canvas id="voiceOrbCanvas" width="112" height="112"></canvas>
+                <span class="orb-mic-glyph" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="9" y="3" width="6" height="11" rx="3"></rect>
+                    <path d="M5 11a7 7 0 0 0 14 0"></path>
+                    <line x1="12" y1="18" x2="12" y2="21"></line>
+                  </svg>
+                </span>
+              </button>
+            </div>
+            <button type="button" class="ref-btn" id="camToggleBtn">Enable preview</button>
+          </div>
+        </div>
+
+        <!-- 60-Second Calm Breathing Overlay -->
+        <div class="breath-overlay" id="breathOverlay" hidden>
+          <div class="breath-inner">
+            <div class="breath-eyebrow">CALM BREATHING &middot; 4-4-4 RHYTHM</div>
+            <div class="breath-ring-wrap">
+              <div class="breath-ring" id="breathRing">
+                <div class="breath-phase" id="breathPhase">Inhale</div>
+                <div class="breath-count" id="breathCount">4</div>
+              </div>
+            </div>
+            <div class="breath-meta">
+              <span id="breathTimer">01:00 remaining</span>
+              <span>&middot;</span>
+              <span id="breathHr">HR -- bpm</span>
+            </div>
+            <button type="button" class="ref-btn" id="breathCloseBtn">End session</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- RIGHT PANEL: YOUR SNAPSHOT (EXACT REFERENCE PROPORTIONS) -->
+      <aside class="snapshot-card" aria-label="Biometric Snapshot">
+        <div class="snapshot-head">
+          <div>
+            <div class="eyebrow">A GENTLE CHECK-IN</div>
+            <h2 class="panel-title">Your snapshot</h2>
+          </div>
+          <div class="status-outline-pill" id="freshPill">OFFLINE</div>
+        </div>
+
+        <div class="seg-tabs" role="tablist" aria-label="Snapshot view mode">
+          <button type="button" class="seg-tab active" id="tabBtnCalm" role="tab" aria-selected="true" data-tab="calm">Calm overview</button>
+          <button type="button" class="seg-tab" id="tabBtnDetail" role="tab" aria-selected="false" data-tab="detail">Detailed readings</button>
+        </div>
+
+        <!-- TAB 1: CALM OVERVIEW -->
+        <div class="tab-panel active" id="tabCalm" role="tabpanel">
+          <div class="metric-grid">
+            <div class="metric-tile" id="tileHr">
+              <div class="tile-label-row">
+                <span class="tile-label">Heart rate</span>
+                <span class="bpm-dot" id="bpmDot" aria-hidden="true"></span>
+              </div>
+              <div class="tile-value">
+                <span id="valHr">--</span><span class="tile-unit"> bpm</span>
+              </div>
+              <div class="tile-sub" id="subHr">
+                <span class="sub-dots"></span><span>Waiting for live reading</span>
+              </div>
+            </div>
+
+            <div class="metric-tile" id="tileSpo2">
+              <div class="tile-label-row">
+                <span class="tile-label">SpO<sub>2</sub></span>
+              </div>
+              <div class="tile-value">
+                <span id="valSpo2">--</span><span class="tile-unit">%</span>
+              </div>
+              <div class="tile-sub" id="subSpo2">
+                <span class="sub-dots"></span><span>Waiting for live reading</span>
+              </div>
+            </div>
+
+            <div class="metric-tile" id="tileSteps">
+              <div class="tile-label-row">
+                <span class="tile-label">Steps today</span>
+              </div>
+              <div class="tile-value">
+                <span id="valSteps">--</span>
+              </div>
+              <div class="tile-sub" id="subSteps">
+                <span class="sub-dots"></span><span>Cumulative daily count</span>
+              </div>
+            </div>
+
+            <div class="metric-tile" id="tileActivity">
+              <div class="tile-label-row">
+                <span class="tile-label">Activity &amp; motion</span>
+              </div>
+              <div class="tile-value compact-val">
+                <span id="valActivity">--</span>
+              </div>
+              <div class="tile-sub" id="subActivity">
+                <span class="sub-dots"></span><span>Motion index --</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="metric-tile wide-tile" id="tileStress">
+            <div class="wide-head">
+              <span class="tile-label" id="stressLabel">Stress / readiness</span>
+              <button type="button" class="inline-action" id="btnStartBreathe">1-min breathe &rarr;</button>
+            </div>
+            <div class="wide-body">
+              <div class="wide-value" id="valStress">--</div>
+              <div class="wide-meta" id="subStress">Waiting for telemetry</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- TAB 2: DETAILED READINGS + FREERTOS v11 KERNEL INSPECTOR -->
+        <div class="tab-panel" id="tabDetail" role="tabpanel" hidden>
+          <div class="detail-box spark-box">
+            <div class="detail-box-head">
+              <span class="tile-label">Heart rate trend <small class="muted">(last 60)</small></span>
+              <span class="mono-meta" id="detailFreshMeta">no data</span>
+            </div>
+            <canvas id="spark" width="600" height="58"></canvas>
+            <div class="detail-mini-stats">
+              <span>Link: <strong id="detailLink">DOWN</strong></span>
+              <span>PPG: <strong id="detailPpg">--</strong></span>
+              <span>Rejects: <strong id="detailRej">0</strong></span>
+              <span>Up: <strong id="detailUp">0s</strong></span>
+            </div>
+          </div>
+
+          <div class="detail-box rtos-box" id="rtosInspector">
+            <div class="detail-box-head">
+              <span class="tile-label">FreeRTOS v11 Kernel</span>
+              <span class="rtos-state-tag" id="rtosKindTag">STANDBY</span>
+            </div>
+
+            <div class="rtos-metrics-grid">
+              <div class="rtos-kv"><span>Tick / Tasks</span><strong id="rtosTickTasks">-- / --</strong></div>
+              <div class="rtos-kv"><span>Period (ms)</span><strong id="rtosPeriod">-- / 1000</strong></div>
+              <div class="rtos-kv"><span>Max Lateness</span><strong id="rtosLateness">-- ms</strong></div>
+              <div class="rtos-kv"><span>Free Heap</span><strong id="rtosHeap">-- KB</strong></div>
+              <div class="rtos-kv"><span>Drops</span><strong id="rtosDrops">0</strong></div>
+              <div class="rtos-kv"><span>Missed (&gt;120ms)</span><strong id="rtosMissed">0</strong></div>
+            </div>
+
+            <div class="queue-row">
+              <span class="queue-lbl">Queue HWM</span>
+              <div class="queue-bar"><div class="queue-fill" id="rtosQueueFill"></div></div>
+              <span class="mono-meta" id="rtosQueueText">0 / 8</span>
+            </div>
+
+            <div class="rtos-cmd-row" id="rtosCmdRow">
+              <button type="button" class="cmd-btn" data-cmd="rest">Rest</button>
+              <button type="button" class="cmd-btn" data-cmd="walk">Walk</button>
+              <button type="button" class="cmd-btn" data-cmd="run">Run</button>
+              <button type="button" class="cmd-btn warn" data-cmd="fall">Fall</button>
+              <button type="button" class="cmd-btn active" data-cmd="auto">Auto</button>
+            </div>
+          </div>
+
+          <div class="detail-actions">
+            <button type="button" class="util-btn" id="btnFastFresh" title="Toggle 15s stale / 30s offline demo timing">
+              Freshness: <strong id="fastFreshLabel">60s / 300s</strong>
+            </button>
+            <button type="button" class="util-btn accent" id="btnInterlockTest" title="Test real fail-closed verifier">
+              Test Safety Interlock
+            </button>
+          </div>
+        </div>
+      </aside>
+    </main>
+
+    <!-- ==================== BOTTOM AI ACTIVITY SECTION (COMPACT, CALM) ==================== -->
+    <section class="activity-card" aria-label="AI Sensor-Grounded Guidance">
+      <div class="activity-head">
+        <div>
+          <div class="eyebrow" id="aiEyebrow">AI ACTIVITY / SENSOR-GROUNDED</div>
+          <h2 class="activity-title">A little guidance, in the moment</h2>
+        </div>
+
+        <!-- Clean Typing Fallback + 2 Subtle Prompt Links (No Button Clutter) -->
+        <div class="ask-toolbar">
+          <div class="subtle-prompts">
+            <button type="button" class="prompt-link" data-q="How am I doing?">Check vitals</button>
+            <span class="prompt-dot">&middot;</span>
+            <button type="button" class="prompt-link" data-q="How is my stress and recovery looking?">Stress &amp; recovery</button>
+          </div>
+          <form class="ask-form" id="askForm" autocomplete="off">
+            <input type="text" id="askInput" class="ask-input" placeholder="Type a question or press Space..." aria-label="Ask KinetiQ">
+            <button type="submit" class="ask-submit" id="askSubmit">Ask</button>
+          </form>
+        </div>
+      </div>
+
+      <div class="guidance-grid">
+        <article class="g-card" id="cardAi">
+          <div class="g-card-top">
+            <span class="g-time" id="aiTime">--:--</span>
+            <span class="g-cat pass" id="aiBadge">GROUNDED AI</span>
+          </div>
+          <h3 class="g-title" id="aiHeadline">Ready for your check-in</h3>
+          <p class="g-body" id="aiBody">Tap the voice orb, press Space, or type above. Every reply is checked against your live snapshot.</p>
+          <div class="g-actions">
+            <button type="button" class="g-link" id="btnReceipt" disabled>Full reply &amp; audit</button>
+            <button type="button" class="g-link muted-link" id="btnReplay" hidden>Replay</button>
+            <button type="button" class="g-link muted-link" id="btnResetChat" title="Start a fresh conversation">New chat</button>
+          </div>
+        </article>
+
+        <article class="g-card" id="cardWellbeing">
+          <div class="g-card-top">
+            <span class="g-time" id="wellTime">--:--</span>
+            <span class="g-cat" id="wellCat">WELLBEING</span>
+          </div>
+          <h3 class="g-title" id="wellTitle">A calm pause is ready</h3>
+          <p class="g-body" id="wellBody">When live readings arrive, gentle hydration, posture, or breathing nudges appear here.</p>
+          <div class="g-actions">
+            <button type="button" class="g-link" id="btnWellAction">Start breathing</button>
+            <button type="button" class="g-link muted-link" id="btnWellAck">Acknowledge</button>
+          </div>
+        </article>
+
+        <article class="g-card" id="cardSnapshot">
+          <div class="g-card-top">
+            <span class="g-time" id="snapTime">--:--</span>
+            <span class="g-cat" id="snapCat">SNAPSHOT</span>
+          </div>
+          <h3 class="g-title" id="snapTitle">Waiting for first live frame</h3>
+          <p class="g-body" id="snapBody">Huawei Band 6 relay or FreeRTOS v11 synthetic lane appears here with verified provenance.</p>
+          <div class="g-actions">
+            <button type="button" class="g-link" id="btnSnapSwitch">Switch to FreeRTOS</button>
+            <button type="button" class="g-link muted-link" id="btnSnapAck">Acknowledge</button>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <!-- ==================== FOOTER BAR (ALWAYS VISIBLE) ==================== -->
+    <footer class="footer-bar">
+      <span class="footer-left">WELLNESS GUIDANCE ONLY. This information is not a medical diagnosis or a substitute for professional care.</span>
+      <span class="footer-right" id="footerRight">Local only &middot; Zero cloud &middot; Waiting for telemetry</span>
+    </footer>
   </div>
-  <div class="hud">
-    <div class="mode-switch" id="modeSwitch" title="Switch active source: Band 6 vs FreeRTOS">
-      <button id="btnModeBand" class="mode-btn active" onclick="setMode('band')">Band 6</button>
-      <button id="btnModeRtos" class="mode-btn rtos" onclick="setMode('rtos')">FreeRTOS</button>
+
+  <!-- GROUNDING RECEIPT MODAL -->
+  <div class="modal-backdrop" id="receiptModal" hidden role="dialog" aria-modal="true" aria-labelledby="receiptTitle">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div>
+          <div class="eyebrow">FAIL-CLOSED VERIFICATION AUDIT</div>
+          <h3 class="modal-title" id="receiptTitle">Grounding Receipt</h3>
+        </div>
+        <button type="button" class="ref-btn" id="receiptCloseBtn">Close</button>
+      </div>
+      <div class="modal-body" id="receiptBody"></div>
     </div>
-    <span class="chip">
-      <span id="lane" style="display:none">LANE</span>
-      <span class="sep" id="laneSep" style="display:none">&middot;</span>
-      <span id="src">...</span>
-    </span>
-    <span class="stpill" id="stChip">OFFLINE</span>
-    <span class="linkgrp">
-      <span class="badge" id="link">LINK</span>
-      <span id="stAge">waiting for first packet</span>
-      <span id="clock">--:--:--</span>
-    </span>
   </div>
-</header>
 
-<main>
-  <section class="col left">
-    <!-- Hero: Live Heart Rate -->
-    <div class="zone hero" id="heroZone">
-      <div id="vals" class="dim">
-        <div class="hero-top">
-          <span class="eyebrow">Live vitals</span>
-          <span class="act" id="activity">REST</span>
-        </div>
-        <div class="hero-num num">
-          <span id="hr">--</span>
-          <div class="unit-stack">
-            <span class="pulse-heart" id="hrPulse" aria-hidden="true"></span>
-            <span class="unit">BPM</span>
-          </div>
-        </div>
-      </div>
-      <div class="age" id="ageH">no data yet</div>
-    </div>
-
-    <!-- Secondary Biometric & Activity Metrics -->
-    <div class="zone tiles">
-      <div class="head">
-        <span class="eyebrow">Secondary metrics</span>
-        <span class="age" id="ageM">no data yet</span>
-      </div>
-      <div id="vals2" class="dim">
-        <div class="tilegrid">
-          <div class="tile">
-            <span class="k">SpO<sub>2</sub> <small class="k-sub">%</small></span>
-            <span class="big" id="spo2">--</span>
-          </div>
-          <div class="tile">
-            <span class="k">Exertion</span>
-            <span class="big" id="ex">--</span>
-          </div>
-          <div class="tile">
-            <span class="k">Steps</span>
-            <span class="big" id="steps">--</span>
-          </div>
-          <div class="tile">
-            <span class="k">PPG Signal</span>
-            <span class="big" id="ppg">--</span>
-          </div>
-        </div>
-        <div class="motion">
-          <span class="k">Motion index</span>
-          <span class="bar"><span id="mbar"></span></span>
-          <span class="big num" id="mv">--</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- Heart Rate Trend Sparkline -->
-    <div class="zone sparkcard">
-      <div class="head">
-        <span class="eyebrow">Heart rate history <small class="eyebrow-sub">(last 60 samples)</small></span>
-        <span class="age" id="ageS">no data yet</span>
-      </div>
-      <canvas id="spark" width="1200" height="140"></canvas>
-    </div>
-  </section>
-
-  <section class="col right">
-    <!-- Optical Presence & Emotion Sensing -->
-    <div class="zone mirror" id="mirror">
-      <div class="head">
-        <span class="eyebrow">The mirror sees you</span>
-        <span class="badge-row">
-          <span id="presBadge" class="pres-badge idle"><span class="dot"></span>No person detected</span>
-          <span id="emoBadge" class="pres-badge idle" style="display:none"><span class="dot"></span>Mood: --</span>
-        </span>
-      </div>
-      <div class="mirror-row">
-        <button id="camBtn" class="btn primary">Activate Camera Mirror</button>
-        <div class="cam-wrap" id="camWrap" style="display:none">
-          <video id="camVideo" autoplay playsinline muted style="display:none"></video>
-        </div>
-      </div>
-      <div class="pres-progress" id="presProgressWrap" aria-hidden="true">
-        <span class="pres-progress-fill" id="presBar"></span>
-      </div>
-      <div class="note" id="camMsg">Click above to start mirror camera presence recognition.</div>
-      <canvas id="camCanvas" width="64" height="48" style="display:none"></canvas>
-    </div>
-
-    <!-- Sensor-Grounded Voice & Text Assistant -->
-    <div class="zone chat" id="chat">
-      <div class="head">
-        <span class="eyebrow">Ask the mirror</span>
-        <span class="note">checked against live data</span>
-      </div>
-      <button id="chatToggle" class="tbtn" title="Collapse assistant" aria-expanded="true" aria-label="Collapse or expand the assistant">&#9662;</button>
-      <div id="msgs">
-        <div class="m assistant">
-          <span class="m-tag">KINETIQ</span>
-          <span class="m-body">I can see your live telemetry &mdash; ask me how you&rsquo;re doing.</span>
-        </div>
-      </div>
-      <div id="lastReply" title="I can see your live telemetry &mdash; ask me how you're doing.">I can see your live telemetry &mdash; ask me how you&rsquo;re doing.</div>
-      <div class="quick-row" id="quickRow">
-        <button type="button" class="qchip" onclick="sendText('How am I doing?')">How am I doing?</button>
-        <button type="button" class="qchip" onclick="sendText('How is my exertion and recovery?')">Recovery check</button>
-        <button type="button" class="qchip" onclick="sendText('Give me a quick breathing or posture tip.')">Breathing tip</button>
-      </div>
-      <div id="qin">
-        <input id="q" placeholder="How am I doing?" autocomplete="off">
-        <button id="mic" class="btn" title="Voice input (mic)">Mic</button>
-        <button id="spk" class="btn primary" title="Spoken replies on/off">Voice On</button>
-        <button id="send" class="btn primary">Send</button>
-      </div>
-    </div>
-  </section>
-</main>
-
-<footer>
-  <span class="disc" id="discText">Sensors simulated &middot; camera motion only &mdash; no video stored or uploaded</span>
-  <span class="diag"><span id="up">uptime --</span> &middot; <span id="rej">rejected frames --</span></span>
-</footer>
-<script src="/static/js/app.js"></script>
+  <script type="module" src="/static/js/mediapipe_face.js"></script>
+  <script src="/static/js/app.js"></script>
 </body>
 </html>

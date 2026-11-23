@@ -1,4 +1,4 @@
-# KINETIQ morning stage check — single entry point, run from repo root:
+﻿# KINETIQ morning stage check — single entry point, run from repo root:
 #   powershell -ExecutionPolicy Bypass -File scripts\morning_check.ps1
 # Exit code = number of FAILs (SKIP never fails). Each section prints PASS/FAIL + evidence.
 
@@ -27,16 +27,16 @@ else { $envFails += "venv python MISSING" }
 $ollamaPresent = $false
 try {
     $tags = (Invoke-RestMethod -Uri "http://localhost:11434/api/tags" -TimeoutSec 3).models.name
-    if ($tags -match "gemma2:2b") { $ollamaPresent = $true }
+    if ($tags -match "qwen3.5:4b" -or $tags -match "gemma2:2b") { $ollamaPresent = $true }
 } catch {}
 if (-not $ollamaPresent) {
     try {
         $ollamaOut = (ollama list 2>&1 | Out-String)
-        if ($ollamaOut -match "gemma2:2b") { $ollamaPresent = $true }
+        if ($ollamaOut -match "qwen3.5:4b" -or $ollamaOut -match "gemma2:2b") { $ollamaPresent = $true }
     } catch {}
 }
-if ($ollamaPresent) { $envInfo += "ollama gemma2:2b present" }
-else { $envFails += "ollama gemma2:2b MISSING" }
+if ($ollamaPresent) { $envInfo += "ollama LLM present" }
+else { $envFails += "ollama LLM (qwen3.5:4b / gemma2:2b) MISSING" }
 
 $NativeExe = Join-Path $Root "hardware\native\kinetiq_native.exe"
 if (-not (Test-Path -LiteralPath $NativeExe)) {

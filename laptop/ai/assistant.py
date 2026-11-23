@@ -108,7 +108,7 @@ if os.path.isdir(_RECEIVER_DIR) and _RECEIVER_DIR not in sys.path:
 from telemetry_schema import TelemetryError, TelemetryRecord  # noqa: E402
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_OLLAMA_MODEL = "gemma2:2b"
+DEFAULT_OLLAMA_MODEL = "qwen3.5:4b"
 DEFAULT_API_MODEL = "gpt-4o-mini"
 DEFAULT_TIMEOUT_S = 30.0
 DEFAULT_MOCK_SECONDS = 3.0
@@ -262,14 +262,42 @@ class PromptBuilder:
     """Turns a telemetry payload + user question into an LLM-ready prompt."""
 
     SYSTEM_PROMPT = (
-        "You are KINETIQ, an intelligent, empathetic AI wellness mirror assistant. "
-        "Your priority is to directly, accurately, and helpfully answer the user's specific health, fitness, or wellness question. "
-        "Ground and personalize your advice around their live vitals (heart rate BPM, activity, exertion, steps) as context. "
-        "Do not repeatedly give generic stretching advice unless asked. "
-        "Never provide formal medical diagnoses or prescriptions. If signal quality is POOR, state that metrics are unverified estimates. "
-        "Keep responses natural, conversational, and concise (under 70 words, 2-4 sentences). "
-        "Do not use any emojis or emoticons in your responses; use plain text only."
+        "You are KINETIQ, a calm, observant, and warm wellness mirror companion. "
+        "Your voice is thoughtful, natural, and human—speaking with the clarity and empathy of a refined personal wellness guide. "
+        "Engage conversationally and directly with what the user says. "
+        "When greeted or asked general questions (e.g. nutrition, sleep, mindfulness, or casual check-ins), "
+        "respond naturally to what they said first, offer a warm follow-up when helpful, and weave in their exact live heart rate "
+        "(e.g. '{heart_rate} BPM') as subtle physiological grounding. "
+        "Never recite a rigid list of vitals or dump steps/exertion mechanically unless specifically asked about their metrics or workouts. "
+        "Never provide formal medical diagnoses or prescriptions. "
+        "If signal quality is POOR, explicitly note that metrics are unverified estimates. "
+        "Keep responses concise, conversational, and elegant (under 70 words, 2-3 crisp sentences). "
+        "Do not use emojis or emoticons; use plain text only."
     )
+
+    @staticmethod
+    def _extract_emotion_cue(visual_context: Optional[Dict[str, Any]]) -> str:
+        if not visual_context or not isinstance(visual_context, dict):
+            return ""
+        mood_raw = str(
+            visual_context.get("mood")
+            or visual_context.get("label")
+            or visual_context.get("descriptor")
+            or ""
+        ).lower()
+        if "happy" in mood_raw:
+            return "User looks Happy — match their bright, warm energy."
+        if "surpris" in mood_raw:
+            return "User looks Surprised (wide-eyed/mouth open) — respond with lighthearted curiosity and calm reassurance, asking what caught them off guard."
+        if "sad" in mood_raw:
+            return "User looks Sad — be extra gentle, empathetic, and comforting; offer one small uplifting thought."
+        if any(k in mood_raw for k in ("angr", "tens", "frustrat")):
+            return "User looks Angry or tense — use a steady, soothing, de-escalating tone and gently suggest relaxing shoulders or a slow breath."
+        if any(k in mood_raw for k in ("calm", "neutral", "settled")):
+            return "User looks Calm — keep a peaceful, grounded, balanced tone."
+        if visual_context.get("tone"):
+            return f"User expression tone: {visual_context['tone']}."
+        return ""
 
     def _format_instruction(
         self,
@@ -277,19 +305,47 @@ class PromptBuilder:
         query: str,
         visual_context: Optional[Dict[str, Any]] = None,
     ) -> str:
-        q_lower = query.lower()
-        is_summary = any(
+        q_clean = query.strip()
+        q_lower = q_clean.lower()
+        is_greeting = any(
+            q_lower == g
+            or q_lower.startswith(g + " ")
+            or q_lower.startswith(g + "!")
+            or q_lower.startswith(g + ",")
+            or q_lower.endswith(" " + g)
+            for g in (
+                "hi",
+                "hello",
+                "hey",
+                "good morning",
+                "good afternoon",
+                "good evening",
+                "greetings",
+            )
+        )
+        is_vitals_query = any(
             w in q_lower
             for w in (
                 "how am i doing",
+                "vital",
+                "vitals",
+                "steps",
+                "heart rate",
+                "hr",
+                "spo2",
+                "metric",
+                "metrics",
+                "stats",
+                "workout",
+                "exercise",
+                "run",
+                "walk",
+                "exertion",
+                "recovery",
                 "summarize",
                 "summary",
-                "hello",
-                "hi",
-                "greeting",
                 "status",
                 "update",
-                "what should i do",
             )
         )
         poor_note = (
@@ -301,29 +357,39 @@ class PromptBuilder:
         if visual_context and isinstance(visual_context, dict):
             desc = visual_context.get("descriptor") or visual_context.get("label")
             face_seen = visual_context.get("face_detected", True)
+            posture = visual_context.get("posture")
+            posture_str = f" with {posture} posture" if posture and posture != "upright" else ""
+            cue = self._extract_emotion_cue(visual_context)
+            cue_clause = f" {cue}" if cue else ""
             if desc and face_seen:
                 visual_note = (
-                    f" Mirror vision observes user appears {desc}."
-                    f" Reflect this empathetically in your tone and advice."
+                    f" Mirror vision observes user appears {desc}{posture_str}.{cue_clause}"
                 )
 
-        act = str(payload.get("activity", "unknown")).strip()
-        act_clause = (
-            f"activity ('{act}'), " if act and act.lower() != "unknown" else ""
-        )
+        if is_greeting:
+            return (
+                f"Greet the user warmly and naturally in a friendly, conversational tone.{visual_note} "
+                f"Observe their present calm state and naturally weave in their exact live heart rate ('{payload['heart_rate']} BPM') "
+                f"as a subtle grounding touch. Ask a brief friendly question about how they are feeling or how their day is going. "
+                f"Do not dump steps or raw metric lists. Do not use emojis.{poor_note}"
+            )
 
-        if is_summary or not query:
+        if is_vitals_query or not query:
+            act = str(payload.get("activity", "unknown")).strip()
+            act_clause = (
+                f"activity ('{act}'), " if act and act.lower() != "unknown" else ""
+            )
             return (
                 f"Directly summarize the user's current wellness state.{visual_note} "
                 f"Mention their current {act_clause}"
                 f"exertion ('{payload['exertion']}'), heart rate ('{payload['heart_rate']} BPM'), and steps ('{payload['steps']} steps'), "
                 f"followed by an encouraging wellness tip. Do not use emojis.{poor_note}"
             )
+
         return (
-            f"First and foremost, directly and thoughtfully answer what the user asked: \"{query}\".{visual_note} "
-            f"Then connect your explanation to their live physiological context (current heart rate '{payload['heart_rate']} BPM', "
-            f"{act_clause}at '{payload['exertion']}' exertion, and '{payload['steps']} steps') where relevant. "
-            f"Provide insightful health guidance rather than generic canned stretching advice. Do not use emojis.{poor_note}"
+            f"First and foremost, directly, warmly, and thoughtfully answer what the user asked: \"{query}\".{visual_note} "
+            f"Seamlessly weave in their current live heart rate ('{payload['heart_rate']} BPM') as natural biometric context. "
+            f"Provide insightful guidance rather than generic canned lists. Do not use emojis.{poor_note}"
         )
 
     def build(
@@ -341,8 +407,12 @@ class PromptBuilder:
         if visual_context and isinstance(visual_context, dict):
             v_desc = visual_context.get("descriptor") or visual_context.get("label")
             face_seen = visual_context.get("face_detected", True)
+            v_post = visual_context.get("posture")
+            post_clause = f" | Posture: {v_post}" if v_post else ""
+            cue = self._extract_emotion_cue(visual_context)
+            cue_clause = f"\nBehavioral Cue: {cue}" if cue else ""
             if v_desc and face_seen:
-                vis_line = f"\nObserved Facial Expression / State: {v_desc}\n"
+                vis_line = f"\nObserved Facial Expression / State: {v_desc}{post_clause}{cue_clause}\n"
         content = (
             f"User: {query}\n\n"
             f"Live Telemetry Context:\n{body}\n{vis_line}\n"
@@ -358,6 +428,7 @@ class PromptBuilder:
         payload: Dict[str, Any],
         user_query: str,
         visual_context: Optional[Dict[str, Any]] = None,
+        model: Optional[str] = None,
     ) -> str:
         """Build one flat prompt string for Ollama's /api/generate endpoint."""
         _validate_payload(payload)
@@ -368,15 +439,31 @@ class PromptBuilder:
         if visual_context and isinstance(visual_context, dict):
             v_desc = visual_context.get("descriptor") or visual_context.get("label")
             face_seen = visual_context.get("face_detected", True)
+            v_post = visual_context.get("posture")
+            post_clause = f" | Posture: {v_post}" if v_post else ""
+            cue = self._extract_emotion_cue(visual_context)
+            cue_clause = f"\nBehavioral Cue: {cue}" if cue else ""
             if v_desc and face_seen:
-                vis_line = f"\nObserved Facial Expression / State: {v_desc}\n"
+                vis_line = f"\nObserved Facial Expression / State: {v_desc}{post_clause}{cue_clause}\n"
+
+        m = str(model or DEFAULT_OLLAMA_MODEL).lower()
+        if "gemma" in m:
+            return (
+                f"<start_of_turn>user\n"
+                f"{self.SYSTEM_PROMPT}\n\n"
+                f"User: {query}\n\n"
+                f"Live Telemetry Context:\n{body}\n{vis_line}\n"
+                f"{instruction}<end_of_turn>\n"
+                f"<start_of_turn>model\n"
+            )
         return (
-            f"<start_of_turn>user\n"
-            f"{self.SYSTEM_PROMPT}\n\n"
+            f"<|im_start|>system\n"
+            f"{self.SYSTEM_PROMPT}<|im_end|>\n"
+            f"<|im_start|>user\n"
             f"User: {query}\n\n"
             f"Live Telemetry Context:\n{body}\n{vis_line}\n"
-            f"{instruction}<end_of_turn>\n"
-            f"<start_of_turn>model\n"
+            f"{instruction}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
         )
 
 
@@ -393,6 +480,7 @@ class AIAdvisor:
     ) -> None:
         self.ollama_url = ollama_url
         self.model = model
+        self.ollama_model = model
         self.api_url = api_url or os.environ.get(ENV_API_URL) or None
         self.api_key = api_key or os.environ.get(ENV_API_KEY) or None
         self.timeout = timeout
@@ -408,7 +496,7 @@ class AIAdvisor:
         """Return a grounded reply, or raise AIUnavailableError."""
         builder = PromptBuilder()
         prompt = builder.build_generate_prompt(
-            payload, user_query, visual_context=visual_context
+            payload, user_query, visual_context=visual_context, model=self.model
         )
         messages = builder.build(
             payload, user_query, visual_context=visual_context
@@ -480,14 +568,14 @@ class AIAdvisor:
             "model": self.model,
             "prompt": prompt,
             "stream": False,
+            "think": False,
             "keep_alive": "60m",
             "options": {
                 "temperature": 0.45,
-                "num_predict": 90,
-                "top_p": 0.85,
-                "top_k": 40,
+                "num_ctx": 2048,
+                "num_predict": 110,
             },
-            "stop": ["<end_of_turn>", "\n\nUser:", "User:"],
+            "stop": ["<end_of_turn>", "<|im_end|>", "\n\nUser:", "User:"],
         }
         try:
             data = self._post_json(self.ollama_url, body)

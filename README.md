@@ -1,16 +1,40 @@
-# KINETIQ — RTOS-Based IoT Healthcare Assistant with Sensor-Grounded Voice AI
+# KINETIQ — Smart Mirror & Real-Time IoT Healthcare Assistant with Sensor-Grounded Voice AI
 
 *"Mirror, Mirror"*: the laptop screen is the mirror's face, its mic and speakers
-are the mirror's voice; the ESP32 is the sensing node that lets it see you.
-A laptop-hosted voice assistant hears and answers the user, watches posture via
-a live motion feed, and grounds every reply in real sensor telemetry.
+are the mirror's voice; the sensing infrastructure lets it see and understand you.
+A laptop-hosted voice assistant hears and answers the user, observes presence and expression
+via a live camera mirror feed, and strictly grounds every spoken reply in real-time sensor telemetry.
 
-Team: Sid (software/firmware) + Tharun (wiring, figures). V1 final review:
-15 Oct 2026. Full version target: 22 Oct 2026. Pivot locked 2026-10-12 —
-see `docs/OVERHAUL_PLAN.md`.
+### Project Team (B.Tech Minor Project — Dept. of Electronics Engineering, Saintgits College of Engineering)
+- **Sidharth Sajith** — System Architecture, Web Platform, AI Assistant & Grounding Engine
+- **Tharun Oommen Jacob** — Huawei Band 6 Relay, Authenticated Receiver & Bridge Integration
+- **Shahazad Abdulla** — FreeRTOS Firmware, Sensor Simulation & Hardware Verification
+- **Project Guide:** Er. Jittu George Eapen, Assistant Professor, Dept. of Electronics Engineering
 
-The pipeline is **Sense → Process → Infer → Communicate → Assist**.
-Heavy AI (STT, LLM, TTS) runs on the laptop; the device is a sensing node.
+---
+
+## Final Review Stage Launcher
+
+To run the complete system with 1-click startup, GPU VRAM pre-warming, authenticated receiver, and frameless kiosk app mode:
+
+```bat
+LAUNCH_FINAL_DEMO.bat
+```
+
+- **Home Edition Smart Mirror:** `http://127.0.0.1:8777/`
+- **Preserved Classic Dashboard:** `http://127.0.0.1:8777/classic`
+- **Wearable Authenticated Receiver:** `http://127.0.0.1:8000/api/wearable/latest`
+
+### Key Architectural Capabilities
+1. **Dual Evidence Lanes:**
+   - **Lane A (Genuine Wearable):** Huawei Band 6 biometrics (heart rate, SpO₂, real stress score 0–100, cumulative steps) relayed over authenticated local HTTP receiver (`:8000`) with zero cloud dependencies.
+   - **Lane B (FreeRTOS v11 Control):** Native compiled FreeRTOS v11 kernel node streaming 1 Hz telemetry with live C kernel telemetry diagnostics (tasks, ticks, heap, max lateness, queue high-water-mark, drops, missed deadlines) and interactive scenario overrides (`rest`, `walk`, `run`, `fall`, `auto`).
+2. **Fail-Closed Sensor-Grounded Voice AI:**
+   - Local `gemma2:2b` LLM via Ollama + `faster-whisper` STT + neural `Edge-TTS` voice.
+   - Strict deterministic verification interlock: any hallucinatory claims (e.g. ungrounded heart rates, fabricated medical diagnoses) are intercepted pre-speech and self-healed into a verified template response with a transparent Grounding Receipt audit trail.
+3. **Rigorous Verification & Quality Gates:**
+   - **40 Automated Tests:** 13 Web Server/API tests + 22 Receiver Authentication/Validation tests + 5 End-to-End Bridge Integration tests.
+   - **8 System Morning-Check Gates (`scripts/morning_check.ps1`):** Environment check, mock stream, grounding test, BLE routing, voice pipeline, native pipe, webcam vision smoke, and GPU warm-up.
 
 ---
 
