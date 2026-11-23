@@ -275,3 +275,68 @@ sequenceDiagram
   * *Answer:* "We implement a strict Biometric RAG grounding pipeline with fail-closed interlocks. The prompt injects current numeric biometrics and explicitly instructs the model: never provide clinical diagnoses or prescriptions, keep replies under 70 words, and warn the user if sensor PPG quality is poor. If the band is offline, the model is informed that data is unavailable rather than guessing."
 * **Q2: Why use MediaPipe FaceLandmarker over traditional OpenCV Haar cascades?**
   * *Answer:* "Haar cascades only provide a 2D bounding box and are prone to lighting false-positives. MediaPipe gives us 478 3D landmarks and 52 facial blendshapes. This allows us to calculate continuous micro-expressions like brow tension and eye blinks, as well as 3D head roll for ergonomic posture coaching, all running offline on GPU via WebGL at 30 FPS."
+
+
+---
+
+## High-Frequency Strategic Examiner Questions & Answers
+
+### 1. Target Audience: "Who is this pointed to? Who is the end-user?"
+
+#### ⚡ 20-Second Pitch (Siddharth):
+> "KinetiQ is primarily designed for **desk-bound professionals and students** who spend 8 to 10 hours a day in sedentary posture experiencing unmonitored stress and eye fatigue, as well as **assisted elder-care environments** where elderly individuals already wear smart bands but struggle with complex smartphone applications. It turns the mirror—an ambient surface they naturally visit every morning and evening—into a zero-interaction wellness checkpoint."
+
+#### 🔍 Detailed Technical Breakdown:
+1. **Sedentary Desk Workers & Remote Professionals:**
+   * **Pain Point:** Suffer from cervical spine strain ("tech-neck"), shallow breathing ("screen apnea"), and invisible stress buildup without taking corrective breaks.
+   * **KinetiQ Value:** Non-intrusive biofeedback. When the user glances at the mirror, it provides real-time neck roll angle warnings and stress-informed breath pacing.
+2. **Ambient Elder-Care & Assisted Living:**
+   * **Pain Point:** Seniors frequently wear affordable fitness trackers, but complex smartphone apps, small touch targets, and Bluetooth pairing screens create massive digital friction.
+   * **KinetiQ Value:** Zero UI friction. The senior simply washes their hands or brushes their teeth; the mirror passively ingests their overnight resting HR, SpO2 stability, and activity progress, offering audible reassurance in plain, calming language.
+3. **Corporate Wellness Pods & University Quiet Zones:**
+   * **Pain Point:** Burnout and acute stress management in high-pressure workplaces and universities.
+   * **KinetiQ Value:** A private 60-second micro-intervention station where users can step in front of the mirror, receive instant physiological grounding, and perform guided breathing without logging into personal corporate accounts.
+
+---
+
+### 2. Applications: "What are the real-world use cases and deployment scenarios?"
+
+#### ⚡ 20-Second Pitch (Tharun & Siddharth):
+> "Beyond a personal bathroom mirror, KinetiQ operates as a **workplace ergonomic guardian**, an **offline edge-computing kiosk for remote patient monitoring (RPM)**, and an **ambient rehabilitation station** in physiotherapy and sports recovery clinics—all while guaranteeing 100% privacy because zero video leaves the physical device."
+
+#### 🔍 4 Tangible Deployment Scenarios:
+* **Scenario A — The Smart-Home Wellness Hub (Ambient Healthcare):**
+  * Integrated behind a two-way beam-splitter mirror in residential master bathrooms.
+  * During the morning routine, it delivers a 20-second natural voice summary: overnight recovery score, resting heart rate trend, SpO2 baseline, and posture readiness for the day.
+* **Scenario B — Enterprise Ergonomics & Micro-Break Stations:**
+  * Deployed in tech offices and call centers. When prolonged head tilt (>15°) coincides with elevated sympathetic stress scores, the mirror suggests dynamic micro-interventions: shoulder rolling, chin tucks, and 4-7-8 breathing exercises.
+* **Scenario C — Privacy-Preserving Remote Patient Monitoring (RPM) Gateway:**
+  * Traditional telehealth cameras transmit raw home video to the cloud, creating privacy and HIPAA compliance liabilities.
+  * KinetiQ acts as an **Edge Gateway**: the 478-point mesh and LLM process vision and biometrics entirely in RAM on the local device, transmitting only anonymized cryptographic telemetry summaries to clinicians.
+* **Scenario D — Sports Recovery & Physical Therapy Clinics:**
+  * Patients perform postural alignment exercises in front of the mirror; the system tracks bilateral symmetry, facial grimacing/pain markers, and cardiovascular strain during post-injury rehabilitation.
+
+---
+
+### 3. Future Scope: "Where does this project go next? What is your roadmap?"
+
+#### ⚡ 20-Second Pitch (Shahazad):
+> "Our immediate next step is compiling our FreeRTOS v11 codebase directly onto **physical dual-core ESP32-S3 and STM32 embedded silicon** with direct hardware PPG sensors, encasing the display in a **true two-way dielectric glass frame**, and running **quantized SLMs on dedicated edge NPUs** for sub-500ms voice response times entirely on low-power 15-watt hardware."
+
+#### 🔍 4-Horizon Engineering Roadmap:
+
+```mermaid
+flowchart LR
+    H1["Phase 1 (Embedded Silicon)<br/>• Port FreeRTOS to ESP32-S3<br/>• Direct BLE Central / MAX30102<br/>• Hardware crypto & I2S audio"] --> H2["Phase 2 (Optical Enclosure)<br/>• 70/30 Beam-splitter mirror<br/>• High-contrast OLED panel<br/>• Wide-angle camera with shutter"]
+    H2 --> H3["Phase 3 (Multi-User Intelligence)<br/>• Edge FaceID profile switching<br/>• Longitudinal HRV baselines<br/>• Encrypted SQLite storage"]
+    H3 --> H4["Phase 4 (On-Device NPU SLM)<br/>• Quantized Qwen 1.5B on NPU<br/>• Sub-500ms voice turnaround<br/>• 15W battery/solar operation"]
+```
+
+1. **Phase 1 — Physical Embedded Silicon (ESP32-S3 / STM32H7):**
+   * *Led by Shahazad:* Migrate the FreeRTOS v11 telemetry tasks from the Windows native simulator to a dual-core ESP32-S3 SoC. This replaces the PC host for telemetry acquisition and introduces direct I2C/SPI interfaces for clinical-grade PPG/ECG analog front-ends (e.g., Analog Devices AD8232, Maxim MAX30102).
+2. **Phase 2 — Physical Optical Mirror Enclosure:**
+   * Mount a high-nit 1080p IPS/OLED display behind a custom 70/30 semi-reflective acrylic dielectric mirror. When the display is black, it functions as a crystal-clear reflection; when pixels light up, the ethereal constellation and vitals float seamlessly on the glass surface.
+3. **Phase 3 — Edge Multi-User Biometric Profiles:**
+   * Integrate lightweight on-device facial embeddings (MobileFaceNet) so family members or office colleagues are automatically recognized upon approaching the mirror, seamlessly switching vitals histories, baselines, and personalized coaching goals.
+4. **Phase 4 — Sub-500ms On-Device NPU SLM:**
+   * Transition from CPU/GPU Ollama execution to dedicated neural processing units (Intel NPU, Hailo-8, or Apple Silicon), running 4-bit quantized Small Language Models (SLMs) with sub-500ms latency, enabling 100% battery-operated or smart-home kiosk installations.
